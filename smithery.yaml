@@ -10,11 +10,11 @@ description: >-
   automation, and tamper-evident on-chain (MINT) work attestation.
 
 # Hosted, URL-based ("external") server — Smithery's Gateway proxies user traffic
-# to the upstream Railway SSE endpoint and injects the user's fnet_ Bearer key.
+# to the upstream Railway Streamable HTTP endpoint and injects the user's fnet_ Bearer key.
 startCommand:
   type: http
-  url: "https://foundrynet-mcp-production.up.railway.app/sse"
-  transport: sse
+  url: "https://foundrynet-mcp-production.up.railway.app/mcp"
+  transport: streamable-http
   configSchema:
     type: object
     required:

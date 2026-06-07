@@ -20,8 +20,9 @@ Upstream calls from each tool still use the shared FOUNDRYNET_API_KEY
 configured on this service (Bearer fnet_… key created via /v1/keys on
 the Forge service); per-user pass-through is a future deliverable.
 
-Transport: SSE for remote Railway hosting. The SSE endpoint is at /sse;
-clients (e.g. Claude Desktop via mcp-remote) connect there.
+Transport: dual. Streamable HTTP at /mcp (modern clients + Smithery's hosted
+gateway, which 405s on legacy SSE) AND legacy SSE at /sse (+ /messages) so
+existing mcp-remote configs published since May keep working. New users get /mcp.
 
 Health check: GET /health (returns config presence without leaking the key).
 
@@ -688,7 +689,7 @@ async def health(request: Request) -> JSONResponse:
         "service":            "foundrynet-mcp",
         "forge_base_url":     FORGE_BASE_URL,
         "key_configured":     bool(FOUNDRYNET_API_KEY),
-        "transport":          "sse",
+        "transport":          "streamable-http",
         "gating":             "per_client_fnet_2tier",
         "supabase_configured": bool(os.environ.get("SUPABASE_URL")
                                     and os.environ.get("SUPABASE_SERVICE_KEY")),
@@ -732,8 +733,10 @@ async def server_card(request: Request) -> JSONResponse:
                 "on Solana via the MINT relay. The agent watches; you stay "
                 "in the loop."
             ),
-            "serverUrl": "https://foundrynet-mcp-production.up.railway.app/sse",
-            "transport": "sse",
+            # Smithery (and MCP-canonical) — lets the publish skip its scan.
+            "serverInfo": {"name": "FoundryNet Forge", "version": "1.1.0"},
+            "serverUrl": "https://foundrynet-mcp-production.up.railway.app/mcp",
+            "transport": "streamable-http",
             "auth": {
                 "type":       "api_key",
                 "header":     "Authorization",
@@ -751,7 +754,7 @@ async def server_card(request: Request) -> JSONResponse:
                     '    "foundrynet-forge": {\n'
                     '      "command": "npx",\n'
                     '      "args": ["-y", "mcp-remote",\n'
-                    '               "https://foundrynet-mcp-production.up.railway.app/sse",\n'
+                    '               "https://foundrynet-mcp-production.up.railway.app/mcp",\n'
                     '               "--header", "Authorization:Bearer ${FNET_KEY}"],\n'
                     '      "env": { "FNET_KEY": "fnet_…  (free key at foundrynet.io/signup)" }\n'
                     '    }\n'
@@ -764,7 +767,7 @@ async def server_card(request: Request) -> JSONResponse:
                     '    "foundrynet-forge": {\n'
                     '      "command": "npx",\n'
                     '      "args": ["-y", "mcp-remote",\n'
-                    '               "https://foundrynet-mcp-production.up.railway.app/sse",\n'
+                    '               "https://foundrynet-mcp-production.up.railway.app/mcp",\n'
                     '               "--header", "Authorization:Bearer ${FNET_KEY}"],\n'
                     '      "env": { "FNET_KEY": "fnet_…" }\n'
                     '    }\n'
@@ -774,7 +777,7 @@ async def server_card(request: Request) -> JSONResponse:
                 "claude_code": (
                     "claude mcp add foundrynet-forge -- "
                     "npx -y mcp-remote "
-                    "https://foundrynet-mcp-production.up.railway.app/sse "
+                    "https://foundrynet-mcp-production.up.railway.app/mcp "
                     "--header \"Authorization:Bearer ${FNET_KEY}\""
                 ),
             },
@@ -843,8 +846,8 @@ async def mcp_endpoints(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "endpoints": [{
-                "url":       "https://foundrynet-mcp-production.up.railway.app/sse",
-                "transport": "sse",
+                "url":       "https://foundrynet-mcp-production.up.railway.app/mcp",
+                "transport": "streamable-http",
                 "name":      "FoundryNet Forge MCP",
             }],
         },
@@ -854,9 +857,36 @@ async def mcp_endpoints(request: Request) -> JSONResponse:
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 
+def build_dual_app():
+    """Serve BOTH transports from one app:
+      • Streamable HTTP at /mcp   — modern clients + Smithery's hosted gateway
+      • legacy SSE at /sse (+ /messages) — existing mcp-remote configs keep working
+    The streamable-http app is primary (carries /mcp + every custom_route, incl. the
+    gating middleware); we graft only the two SSE transport routes onto it and chain
+    both lifespans so each transport's session manager starts. New users get /mcp;
+    pre-existing /sse configs (published since May) don't break."""
+    import contextlib
+    main_app = mcp.http_app(transport="http", path="/mcp")   # /mcp + custom routes
+    sse_app = mcp.http_app(transport="sse", path="/sse")      # /sse + /messages
+    for r in sse_app.routes:
+        if getattr(r, "path", None) in ("/sse", "/messages"):
+            main_app.router.routes.append(r)
+    main_life, sse_life = main_app.router.lifespan_context, sse_app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def _dual_lifespan(app):
+        async with main_life(app):
+            async with sse_life(app):
+                yield
+    main_app.router.lifespan_context = _dual_lifespan
+    return main_app
+
+
 if __name__ == "__main__":
+    import uvicorn
     logger.info(
         f"FoundryNet MCP starting on 0.0.0.0:{PORT} "
-        f"(forge={FORGE_BASE_URL}, key_configured={bool(FOUNDRYNET_API_KEY)})"
+        f"(forge={FORGE_BASE_URL}, key_configured={bool(FOUNDRYNET_API_KEY)}) "
+        f"— dual transport: /mcp (streamable-http) + /sse (legacy)"
     )
-    mcp.run(transport="sse", host="0.0.0.0", port=PORT)
+    uvicorn.run(build_dual_app(), host="0.0.0.0", port=PORT, log_level="warning")

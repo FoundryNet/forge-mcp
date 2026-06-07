@@ -32,8 +32,8 @@
   ],
   "remotes": [
     {
-      "type": "sse",
-      "url": "https://foundrynet-mcp-production.up.railway.app/sse"
+      "type": "streamable-http",
+      "url": "https://foundrynet-mcp-production.up.railway.app/mcp"
     }
   ]
 }
