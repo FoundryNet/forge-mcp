@@ -697,6 +697,12 @@ async def health(request: Request) -> JSONResponse:
     })
 
 
+@mcp.custom_route("/ping", methods=["GET"])
+async def ping(request: Request) -> JSONResponse:
+    """Liveness for hosted runtimes that probe /ping (mcp-proxy etc.)."""
+    return JSONResponse({"status": "ok"})
+
+
 # ── /.well-known/mcp* — public discovery endpoints ──────────────────────────
 # Auth-free metadata that MCP crawlers / hubs (glama.ai, smithery, mcp.so,
 # pulsemcp, awesome-mcp-servers) pull to enumerate this server without a
