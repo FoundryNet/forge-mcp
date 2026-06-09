@@ -1,8 +1,10 @@
 # FoundryNet — Industrial Machine Intelligence
 
-The cross-manufacturer industrial MCP server. Talk to any CNC, robot, or industrial
-machine in natural language — machine identity, telemetry normalization across 16 OEM
-families, plain-English automation, and tamper-evident on-chain work attestation.
+The cross-manufacturer industrial MCP server for **machine monitoring**. Talk to any
+CNC, robot, or industrial machine in natural language — machine identity, **OPC UA /
+MQTT / Modbus telemetry normalization** across 16 OEM families, plain-English
+automation, and tamper-evident on-chain **work attestation and verification** so every
+industrial action carries a verifiable trust record.
 
 Hosted MCP over Streamable HTTP (legacy SSE still supported). 14 tools wrap the Forge v1 API: provision a stable machine identity,
 normalize raw OEM telemetry into a canonical schema, query operational history, parse and
@@ -10,7 +12,7 @@ activate plain-English automations, and settle work on Solana via the MINT relay
 state-changing action has a verifiable, tamper-evident hash.
 
 - **Website:** https://foundrynet.io
-- **Docs:** https://foundrynet.io/docs · **Free key:** https://foundrynet.io/signup
+- **Docs:** https://foundrynet.io/mcp-industrial · **Free key:** https://foundrynet.io/signup
 - **MCP endpoint:** `https://foundrynet-mcp-production.up.railway.app/mcp` (Streamable HTTP)
 - **Legacy SSE:** `https://foundrynet-mcp-production.up.railway.app/sse` (deprecated)
 - **Health:** `https://foundrynet-mcp-production.up.railway.app/health`
@@ -94,6 +96,14 @@ Get a free `fnet_` key at https://foundrynet.io/signup (50 normalize calls, no c
 - `smithery.yaml` — Smithery listing metadata
 - `requirements.txt` — `fastmcp>=2.0`, `httpx>=0.27`
 - `Procfile` — Railway start command (`web: python mcp_server.py`)
+
+## Resources
+
+- [Machine Identity for the Agent Economy](https://foundrynet.io/machine-identity)
+- [Work Attestation for Industrial Equipment](https://foundrynet.io/work-attestation)
+- [MCP for Industrial Equipment](https://foundrynet.io/mcp-industrial)
+- [MINT Protocol — agent trust & attestation](https://github.com/FoundryNet/mint-mcp)
+- [Explorer](https://mint-explorer.vercel.app)
 
 ## License
 
