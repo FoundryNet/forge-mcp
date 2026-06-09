@@ -4,14 +4,15 @@ The cross-manufacturer industrial MCP server. Talk to any CNC, robot, or industr
 machine in natural language — machine identity, telemetry normalization across 16 OEM
 families, plain-English automation, and tamper-evident on-chain work attestation.
 
-Hosted MCP over SSE. 14 tools wrap the Forge v1 API: provision a stable machine identity,
+Hosted MCP over Streamable HTTP (legacy SSE still supported). 14 tools wrap the Forge v1 API: provision a stable machine identity,
 normalize raw OEM telemetry into a canonical schema, query operational history, parse and
 activate plain-English automations, and settle work on Solana via the MINT relay so every
 state-changing action has a verifiable, tamper-evident hash.
 
 - **Website:** https://foundrynet.io
 - **Docs:** https://foundrynet.io/docs · **Free key:** https://foundrynet.io/signup
-- **SSE endpoint:** `https://foundrynet-mcp-production.up.railway.app/sse`
+- **MCP endpoint:** `https://foundrynet-mcp-production.up.railway.app/mcp` (Streamable HTTP)
+- **Legacy SSE:** `https://foundrynet-mcp-production.up.railway.app/sse` (deprecated)
 - **Health:** `https://foundrynet-mcp-production.up.railway.app/health`
 - **Server card:** `https://foundrynet-mcp-production.up.railway.app/.well-known/mcp/server-card.json`
 
@@ -32,7 +33,7 @@ separate Railway service, separate dependencies (`fastmcp` + `httpx`).
 
 ```
 Claude Desktop / agent
-        │ SSE (mcp-remote bridge)
+        │ Streamable HTTP (mcp-remote bridge)
         ▼
   foundrynet-mcp on Railway
         │ HTTPS + Bearer fnet_…
@@ -53,8 +54,8 @@ Free tier exposes the read-only tools; Pro ($49/mo) unlocks the full set.
 ## Connect (Claude Desktop, Cursor, any MCP client)
 
 ```bash
-claude mcp add --transport sse foundrynet \
-  https://foundrynet-mcp-production.up.railway.app/sse \
+claude mcp add --transport http foundrynet \
+  https://foundrynet-mcp-production.up.railway.app/mcp \
   --header "Authorization: Bearer fnet_YOUR_KEY"
 ```
 
@@ -66,7 +67,7 @@ Or via `claude_desktop_config.json` with the `mcp-remote` bridge:
     "foundrynet": {
       "command": "npx",
       "args": ["-y", "mcp-remote",
-               "https://foundrynet-mcp-production.up.railway.app/sse",
+               "https://foundrynet-mcp-production.up.railway.app/mcp",
                "--header", "Authorization:Bearer ${FNET_KEY}"],
       "env": { "FNET_KEY": "fnet_…  (get a free key at foundrynet.io/signup)" }
     }
@@ -96,4 +97,4 @@ Get a free `fnet_` key at https://foundrynet.io/signup (50 normalize calls, no c
 
 ## License
 
-Proprietary (commercial). © FoundryNet. Contact: foundrynet@proton.me
+Proprietary (commercial). © FoundryNet. Contact: hello@foundrynet.io
