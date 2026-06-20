@@ -1,53 +1,48 @@
-# Smithery listing metadata — FoundryNet Forge MCP
-# Scope stays @foundrynet/forge so Smithery RE-INDEXES the existing listing
-# (do not rename the scope — that would create a new, empty listing).
 name: "@foundrynet/forge"
-displayName: "FoundryNet — Industrial Machine Intelligence"
+displayName: "FoundryNet Industrial Intelligence"
 description: >-
-  Natural language to machine action. Industrial machine monitoring over MCP:
-  cross-manufacturer telemetry normalization across 16 OEM families (OPC UA, MQTT,
-  Modbus, Fanuc/Siemens CNC, robots) with thousands of confirmed field mappings.
-  14 MCP tools for machine identity, telemetry normalization, operational history,
-  plain-English automation, and tamper-evident on-chain (MINT) work attestation and
-  verification — a verifiable trust record for every industrial action.
-
-# Hosted, URL-based ("external") server — Smithery's Gateway proxies user traffic
-# to the upstream Railway Streamable HTTP endpoint and injects the user's fnet_ Bearer key.
+  Cross-OEM industrial telemetry normalization across 18 equipment manufacturers with 366 canonical fields. Runtime kernel for machine data pipelines.
+icon: "🏭"
+homepage: "https://foundrynet.io"
+repository: "https://github.com/FoundryNet/forge-mcp"
+license: "MIT"
+categories:
+  - industrial
+  - data
+  - iot
+tags:
+  - industrial-telemetry
+  - opc-ua
+  - cnc
+  - fanuc
+  - siemens
+  - machine-data
+  - normalization
+  - iot
+keywords:
+  - industrial-telemetry
+  - opc-ua
+  - cnc
+  - fanuc
+  - siemens
+  - machine-data
+  - normalization
+  - iot
+attestation:
+  protocol: "MINT Protocol"
+  verified_outputs: true
+  live_feed: "https://mint.foundrynet.io/feed"
+network:
+  name: "FoundryNet Data Network"
+  servers: 17
 startCommand:
   type: http
   url: "https://foundrynet-mcp-production.up.railway.app/mcp"
   transport: streamable-http
   configSchema:
     type: object
-    required:
-      - api_key
     properties:
       api_key:
         type: string
-        title: "FoundryNet API key"
-        description: "fnet_ Bearer key — get one free at foundrynet.io/signup"
-
-homepage: "https://foundrynet.io"
-documentationUrl: "https://foundrynet.io/mcp-industrial"
-license: "Proprietary"
-keywords:
-  - industrial
-  - manufacturing
-  - machine-identity
-  - machine-monitoring
-  - cnc
-  - plc
-  - robotics
-  - telemetry
-  - normalization
-  - opc-ua
-  - modbus
-  - mqtt
-  - iot
-  - automation
-  - attestation
-  - verification
-  - trust
-  - on-chain
-  - mint
-  - solana
+        title: "Forge billing key (optional)"
+        description: "fnet_ key to bypass the per-query x402 paywall and bill to a Forge account."
