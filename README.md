@@ -51,7 +51,7 @@ Identity & data: `identify_machine`, `normalize_telemetry`, `query_machine_histo
 `query_webhook_history`. Attestation: `verify_on_chain`. Demo: `fire_sandbox` (the full
 watch → fire → settle loop, no card).
 
-Free tier exposes the read-only tools; Pro ($49/mo) unlocks the full set.
+Free tier exposes the read-only tools; Intel ($49/mo) unlocks the full set.
 
 ## Connect (Claude Desktop, Cursor, any MCP client)
 
@@ -77,7 +77,7 @@ Or via `claude_desktop_config.json` with the `mcp-remote` bridge:
 }
 ```
 
-Get a free `fnet_` key at https://foundrynet.io/signup (50 normalize calls, no card).
+Get a free `fnet_` key at https://foundrynet.io/signup (5 normalize calls, no card).
 
 ## Required environment (server-side)
 
