@@ -1,31 +1,28 @@
-# FoundryNet — Industrial Machine Intelligence
+# Forge by Foundry Labs — Industrial Machine Intelligence
 
-The cross-manufacturer industrial MCP server for **machine monitoring**. Talk to any
-CNC, robot, or industrial machine in natural language — machine identity, **OPC UA /
-MQTT / Modbus telemetry normalization** across 16 OEM families, plain-English
-automation, and tamper-evident on-chain **work attestation and verification** so every
-industrial action carries a verifiable trust record.
+The cross-manufacturer industrial MCP server. Talk to any CNC, robot, or industrial
+machine in natural language — machine identity, telemetry normalization across 18 OEM
+families, plain-English automation, and tamper-evident work attestation.
 
-Hosted MCP over Streamable HTTP (legacy SSE still supported). 14 tools wrap the Forge v1 API: provision a stable machine identity,
-normalize raw OEM telemetry into a canonical schema, query operational history, parse and
-activate plain-English automations, and settle work on Solana via the MINT relay so every
-state-changing action has a verifiable, tamper-evident hash.
+Hosted MCP over Streamable HTTP. 30 tools wrap the Forge v1 API: provision a stable machine
+identity, normalize raw OEM telemetry into a canonical schema, query operational history,
+parse and activate plain-English automations, predict failures (TimesFM), score fleet health,
+and record every state-changing action as a verifiable, tamper-evident attestation.
 
-- **Website:** https://foundrynet.io
-- **Docs:** https://foundrynet.io/mcp-industrial · **Free key:** https://foundrynet.io/signup
-- **MCP endpoint:** `https://foundrynet-mcp-production.up.railway.app/mcp` (Streamable HTTP)
-- **Legacy SSE:** `https://foundrynet-mcp-production.up.railway.app/sse` (deprecated)
-- **Health:** `https://foundrynet-mcp-production.up.railway.app/health`
-- **Server card:** `https://foundrynet-mcp-production.up.railway.app/.well-known/mcp/server-card.json`
+- **Website:** https://foundrynet.io/?utm_source=github&utm_medium=readme&utm_campaign=forge-mcp-readme
+- **Docs:** https://foundrynet.io/docs?utm_source=github&utm_medium=readme&utm_campaign=forge-mcp-readme · **Free key:** https://foundrynet.io/signup?utm_source=github&utm_medium=readme&utm_campaign=forge-mcp-readme
+- **MCP endpoint (Streamable HTTP):** `https://mcp.foundrynet.io/mcp`
+- **Legacy SSE endpoint (still served):** `https://mcp.foundrynet.io/sse`
+- **Health:** `https://mcp.foundrynet.io/health`
+- **Server card:** `https://mcp.foundrynet.io/.well-known/mcp/server-card.json`
 
 ## What it does
 
-It normalizes raw OEM telemetry from **16 manufacturer families** into one canonical
+It normalizes raw OEM telemetry from **18 manufacturer families** into one canonical
 vocabulary with thousands of confirmed field mappings — so an agent writes against one set
 of field names whether the machine is a Fanuc CNC, a KUKA arm, or a Universal Robots cobot.
 On top of that it turns plain-English instructions into structured automations (review then
-activate), and anchors every state-changing action on-chain via MINT for a tamper-evident
-work record.
+activate), and records every state-changing action as a tamper-evident attestation.
 
 ## Architecture
 
@@ -35,7 +32,7 @@ separate Railway service, separate dependencies (`fastmcp` + `httpx`).
 
 ```
 Claude Desktop / agent
-        │ Streamable HTTP (mcp-remote bridge)
+        │ Streamable HTTP (/mcp) — or legacy SSE (/sse)
         ▼
   foundrynet-mcp on Railway
         │ HTTPS + Bearer fnet_…
@@ -43,21 +40,25 @@ Claude Desktop / agent
   forge.foundrynet.io/v1/*
 ```
 
-## Tools (14)
+## Tools (30)
 
 Identity & data: `identify_machine`, `normalize_telemetry`, `query_machine_history`,
 `get_coverage`, `correct_mapping`. Automation: `create_automation`, `activate_automation`,
 `list_automations`, `disable_automation`, `delete_automation`, `restore_automation`,
-`query_webhook_history`. Attestation: `verify_on_chain`. Demo: `fire_sandbox` (the full
-watch → fire → settle loop, no card).
+`query_webhook_history`. Prediction (TimesFM): `predict`, `predict_breach`, `remaining_life`,
+`predict_batch`, `fleet_health`, `detect_anomalies`, `machine_intelligence`,
+`prediction_accuracy`. Operations: `calculate_oee`, `fleet_oee`, `energy_consumption`,
+`shift_report`, `diagnose_machine`, `health_index`. Agents: `get_agent_card`, `list_agents`.
+Attestation: `verify_record`. Demo: `fire_sandbox` (the full watch → fire → settle loop, no card).
 
-Free tier exposes the read-only tools; Intel ($49/mo) unlocks the full set.
+Free tier exposes the read-only tools; metered pay-per-use unlocks the premium prediction
+and diagnostics tools (see https://forge.foundrynet.io/pricing?utm_source=github&utm_medium=readme&utm_campaign=forge-mcp-readme).
 
 ## Connect (Claude Desktop, Cursor, any MCP client)
 
 ```bash
-claude mcp add --transport http foundrynet \
-  https://foundrynet-mcp-production.up.railway.app/mcp \
+claude mcp add --transport http foundrynet-forge \
+  https://mcp.foundrynet.io/mcp \
   --header "Authorization: Bearer fnet_YOUR_KEY"
 ```
 
@@ -66,10 +67,10 @@ Or via `claude_desktop_config.json` with the `mcp-remote` bridge:
 ```json
 {
   "mcpServers": {
-    "foundrynet": {
+    "foundrynet-forge": {
       "command": "npx",
       "args": ["-y", "mcp-remote",
-               "https://foundrynet-mcp-production.up.railway.app/mcp",
+               "https://mcp.foundrynet.io/mcp",
                "--header", "Authorization:Bearer ${FNET_KEY}"],
       "env": { "FNET_KEY": "fnet_…  (get a free key at foundrynet.io/signup)" }
     }
@@ -77,7 +78,10 @@ Or via `claude_desktop_config.json` with the `mcp-remote` bridge:
 }
 ```
 
-Get a free `fnet_` key at https://foundrynet.io/signup (5 normalize calls, no card).
+Legacy SSE (`--transport sse` against `https://mcp.foundrynet.io/sse`) remains supported for
+existing configs, but new integrations should use the Streamable HTTP `/mcp` endpoint above.
+
+Get a free `fnet_` key at https://foundrynet.io/signup?utm_source=github&utm_medium=readme&utm_campaign=forge-mcp-readme (50 normalize calls, no card).
 
 ## Required environment (server-side)
 
@@ -90,21 +94,13 @@ Get a free `fnet_` key at https://foundrynet.io/signup (5 normalize calls, no ca
 
 ## Files
 
-- `mcp_server.py` — the server (14 tools + `/health` + `/.well-known/mcp` routes)
+- `mcp_server.py` — the server (30 tools + `/health` + `/.well-known/mcp` routes)
 - `gating.py` — per-client tier gating (Free vs Pro tool/quota enforcement)
 - `server.json` — MCP registry metadata (name, description, keywords, remote endpoint)
 - `smithery.yaml` — Smithery listing metadata
 - `requirements.txt` — `fastmcp>=2.0`, `httpx>=0.27`
 - `Procfile` — Railway start command (`web: python mcp_server.py`)
 
-## Resources
-
-- [Machine Identity for the Agent Economy](https://foundrynet.io/machine-identity)
-- [Work Attestation for Industrial Equipment](https://foundrynet.io/work-attestation)
-- [MCP for Industrial Equipment](https://foundrynet.io/mcp-industrial)
-- [MINT Protocol — agent trust & attestation](https://github.com/FoundryNet/mint-mcp)
-- [Explorer](https://mint-explorer.vercel.app)
-
 ## License
 
-Proprietary (commercial). © FoundryNet. Contact: hello@foundrynet.io
+Proprietary (commercial). © Foundry Labs LLC. Contact: forge@foundrynet.io
