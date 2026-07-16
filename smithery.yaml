@@ -9,7 +9,7 @@ description: >-
   30 MCP tools for machine identity, normalization, history, plain-English
   automation, TimesFM prediction (forecast, threshold-breach, remaining-life,
   batch + fleet health, anomaly detection, full-stack machine intelligence),
-  and tamper-evident work attestation.
+  and tamper-evident, hash-verified work attestation.
 
 # Hosted, URL-based ("external") server — Smithery's Gateway proxies user traffic
 # to the upstream Railway Streamable HTTP endpoint and injects the user's fnet_ Bearer key.
