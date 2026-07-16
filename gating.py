@@ -8,11 +8,11 @@ against a tier→tools allowlist, and atomically check+increment a monthly
 usage counter against the per-tier cap.
 
 Two tiers (Enterprise + attest_machine_action are deferred):
-  • Free  — 7 tools (read-only + fire_sandbox + corpus-feedback +
-            coverage introspection), 100 calls/month. Free keys are minted
-            self-serve via /v1/keys (no Stripe binding); `free_tier=true`
-            in forge_api_keys. Demo (chat-minted) keys also fall here.
-  • Pro   — all 14 deployed tools, 10 000 calls/month. Any active
+  • Free  — 7 tools (normalize + read-only history/coverage + fire_sandbox demo
+            + corpus-feedback), 100 calls/month. Free keys are minted self-serve
+            via /v1/keys (no Stripe binding); `free_tier=true` in forge_api_keys.
+            Demo (chat-minted) keys also fall here.
+  • Pro   — all 29 deployed tools, 10 000 calls/month. Any active
             forge_api_keys row without `free_tier=true` (i.e. paid keys
             with a Stripe subscription) qualifies as Pro.
 
@@ -32,8 +32,14 @@ import hashlib
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+try:
+    import jwt as _pyjwt            # PyJWT — optional at import so a missing dep
+except Exception:                   # can't take the whole server down; OAuth just
+    _pyjwt = None                   # stays disabled until the dep + secret land.
 
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
@@ -44,23 +50,44 @@ logger = logging.getLogger("foundrynet.mcp.gating")
 
 # ── Tier → tools (existing tool names; spec's `normalize_field` etc. map
 #    1:1 by intent — see error messages and README for the spec↔code map).
+# The DISCOVERY set: everything a new developer needs to see the product WORK
+# before they'll pay. A dev must be able to normalize their data, identify a
+# machine, check coverage, correct a mapping, read an agent card, and discover
+# other agents — all on a free sandbox key over MCP. These mirror the free
+# surface of the REST API so MCP and REST agree on what "free" means.
 FREE_TOOLS: frozenset[str] = frozenset({
-    "normalize_telemetry",     # spec: normalize_field
+    "normalize_telemetry",     # THE first-value call — normalize any OEM's telemetry
+    "identify_machine",        # register/identify a machine — discovery, free
+    "get_coverage",            # pre-flight schema introspection (the "get_schema" need)
+    "correct_mapping",         # corpus-improvement signal — free so every interaction trains the corpus
+    "get_agent_card",          # agent credentials/reputation — discovery, free
+    "list_agents",             # agent discovery — free so agents can find each other to coordinate
     "query_machine_history",   # spec: query_machine_data + get_machine_history
     "list_automations",        # spec: get_integrations (lists configured automations)
     "query_webhook_history",   # spec: get_integrations (delivery / status)
     "fire_sandbox",            # demo-to-conversion unlock: full loop, 10 fires/key lifetime
-    "correct_mapping",         # corpus-improvement signal — free so every interaction trains the corpus
-    "get_coverage",            # pre-flight schema introspection — free so agents can check before trying
 })
 ALL_TOOLS: frozenset[str] = FREE_TOOLS | frozenset({
-    "identify_machine",        # spec: register_machine (Pro)
     "create_automation",       # spec: create_trigger (Pro)
     "activate_automation",     # spec: execute_action (Pro)
     "disable_automation",
     "delete_automation",
     "restore_automation",
-    "verify_on_chain",         # spec: settle_machine_work (Pro)
+    "verify_record",           # spec: settle_machine_work (Pro) — canonical settle tool
+    "predict",                 # TimesFM forecast (Pro — runs ML inference, ~$0.05/call)
+    "predict_breach",          # parametric-insurance threshold-breach primitive (Pro)
+    "remaining_life",          # remaining-useful-life estimate (Pro)
+    "predict_batch",           # fleet-scale batch prediction (Pro — $0.02/machine)
+    "fleet_health",            # fleet health dashboard (Pro — $0.50/assessment)
+    "detect_anomalies",        # statistical anomaly detection (Pro — $0.02, no ML inference)
+    "machine_intelligence",    # full-stack machine analysis (Pro — $0.25/call)
+    "diagnose_machine",        # LLM root-cause analysis (Pro — $0.25/call)
+    "prediction_accuracy",     # Pro — forecast-quality trust signal
+    "calculate_oee",           # Pro — OEE analytics
+    "fleet_oee",               # Pro — whole-floor OEE
+    "energy_consumption",      # Pro — energy + cost per machine
+    "shift_report",            # Pro — shift handover summary
+    "health_index",            # Pro — composite multi-sensor health
 })
 
 FREE_CAP = int(os.environ.get("MCP_FREE_CAP", "100"))
@@ -74,10 +101,42 @@ PRO_CAP  = int(os.environ.get("MCP_PRO_CAP",  "10000"))
 SANDBOX_FIRE_CAP   = int(os.environ.get("MCP_SANDBOX_FIRE_CAP", "10"))
 SANDBOX_MONTH_KEY  = "sandbox-lifetime"
 
-PRICING_URL = os.environ.get("MCP_PRICING_URL", "https://foundrynet.io/pricing")
-SIGNUP_URL  = os.environ.get("MCP_SIGNUP_URL",  "https://foundrynet.io/signup")
+# The pricing/signup pages live on forge.foundrynet.io — foundrynet.io/pricing
+# is a 404, so pointing an upgrade CTA there is a closed door on a paying
+# customer. Defaults corrected here AND the Railway env vars are updated to match.
+PRICING_URL = os.environ.get("MCP_PRICING_URL", "https://forge.foundrynet.io/pricing")
+SIGNUP_URL  = os.environ.get("MCP_SIGNUP_URL",  "https://forge.foundrynet.io/")
 
-API_KEY_PREFIX = "fnet_"
+API_KEY_PREFIX = "fnet_"   # legacy default — kept for cosmetic error-message refs
+
+# Every Forge key namespace the MCP server accepts. It used to be fnet_-only,
+# which rejected every forge_prod_/forge_sandbox_/forge_monitor_/forge_agent_
+# key the main product now mints — i.e. a paying Runtime customer's key was
+# denied at the door. All of these resolve through the same forge_api_keys
+# SHA256 hash lookup, so validation is identical; only the tier differs.
+ACCEPTED_KEY_PREFIXES = ("fnet_", "forge_prod_", "forge_sandbox_",
+                         "forge_monitor_", "forge_agent_")
+
+# ── OAuth 2.0 client-credentials (RFC 6749 §4.4) config ──────────────────────
+# Machine-to-machine flow AWS Bedrock AgentCore Gateway + Azure AI Foundry
+# expect: the caller POSTs its Forge API key as `client_secret` to /oauth/token
+# and gets back a short-lived HS256 JWT it then presents as a normal Bearer
+# token. The MCP auth path accepts BOTH the JWT and the raw key (see
+# resolve_bearer) so existing `Authorization: Bearer forge_prod_…` clients are
+# untouched. Signing is disabled (issue returns None, resolve falls back to key
+# lookup) until BOTH PyJWT is importable AND MCP_JWT_SECRET is set — so a
+# half-configured deploy degrades to today's key-only behavior, never a 500.
+JWT_SECRET      = (os.environ.get("MCP_JWT_SECRET") or "").strip()
+JWT_ALG         = "HS256"
+JWT_TTL_SECONDS = int(os.environ.get("MCP_JWT_TTL", "3600"))   # 1 hour
+OAUTH_ISSUER    = (os.environ.get("MCP_OAUTH_ISSUER")
+                   or "https://mcp.foundrynet.io").rstrip("/")
+
+
+def oauth_enabled() -> bool:
+    """True only when JWTs can actually be signed/verified."""
+    return bool(_pyjwt and JWT_SECRET)
+
 
 _client: Optional[Client] = None
 
@@ -112,17 +171,47 @@ def _current_month_utc() -> str:
 
 # ── Key validation + tier resolution ─────────────────────────────────────────
 
+def _parse_ts(val) -> Optional[datetime]:
+    """Parse a Supabase timestamptz into an aware datetime, else None. Never raises."""
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+    try:
+        s = str(val).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _tier_for_row(row: dict) -> str:
+    """Map a forge_api_keys row to 'free' or 'pro'.
+
+    Prefer the `plan` column, which forge-prod sets for all current key
+    namespaces (production/monitoring = pro, sandbox = free). forge_agent_
+    keys carry their parent account's plan, so they inherit its tier here.
+    Fall back to free_tier / is_demo for legacy fnet_ keys that have no plan.
+    """
+    plan = (row.get("plan") or "").strip().lower()
+    if plan in ("production", "monitoring"):
+        return "pro"
+    if plan == "sandbox":
+        return "free"
+    return "free" if (row.get("free_tier") or row.get("is_demo")) else "pro"
+
+
 def validate_key(token: str) -> Optional[dict]:
     """Return {user_id, tier, key_id} on a hit, None on any miss.
 
-    tier == 'free' when the key was minted with free_tier=true OR is_demo=true;
-    tier == 'pro' otherwise (paid key, has a Stripe subscription).
-
-    Mirrors forge-prod/api.py's `_lookup_api_key_user` SHA256 + active-row
-    scheme so a single key works against both Forge API and the MCP server.
+    Accepts every Forge key namespace (fnet_/forge_prod_/forge_sandbox_/
+    forge_monitor_/forge_agent_). Mirrors forge-prod's `_lookup_api_key_user`:
+    a key is live when status is 'active', OR 'rotating' and still inside its
+    grace window, AND not past expires_at — so rotated keys keep working during
+    their 24h grace and a paying customer's forge_prod_ key authenticates.
     """
     token = (token or "").strip()
-    if not token.startswith(API_KEY_PREFIX):
+    if not token.startswith(ACCEPTED_KEY_PREFIXES):
         return None
     client = _supabase()
     if client is None:
@@ -130,9 +219,10 @@ def validate_key(token: str) -> Optional[dict]:
     try:
         h = _hash_api_key(token)
         r = (client.table("forge_api_keys")
-             .select("id,user_id,status,is_demo,free_tier,stripe_subscription_id")
+             .select("id,user_id,status,is_demo,free_tier,plan,"
+                     "stripe_subscription_id,rotation_grace_until,expires_at")
              .eq("key_hash", h)
-             .eq("status", "active")
+             .in_("status", ["active", "rotating"])
              .limit(1)
              .execute())
     except Exception as e:
@@ -142,8 +232,93 @@ def validate_key(token: str) -> Optional[dict]:
     if not rows:
         return None
     row = rows[0]
-    tier = "free" if (row.get("free_tier") or row.get("is_demo")) else "pro"
-    return {"user_id": row["user_id"], "tier": tier, "key_id": row["id"]}
+    now = datetime.now(timezone.utc)
+    # Hard expiry (opt-in; NULL = never) — mirror forge-prod's lazy expiry.
+    exp = _parse_ts(row.get("expires_at"))
+    if exp is not None and now > exp:
+        return None
+    # Rotation grace: a 'rotating' key is live only inside its window.
+    if row.get("status") == "rotating":
+        grace = _parse_ts(row.get("rotation_grace_until"))
+        if grace is None or now > grace:
+            return None
+    return {"user_id": row["user_id"], "tier": _tier_for_row(row), "key_id": row["id"]}
+
+
+# ── OAuth: mint + verify JWT access tokens ───────────────────────────────────
+
+def issue_access_token(client_id: str, client_secret: str) -> Optional[dict]:
+    """client_credentials grant. `client_secret` IS a Forge API key: validate
+    it, then mint a 1-hour HS256 JWT. Returns the RFC 6749 §5.1 token response,
+    or None when the key is invalid or signing isn't configured (the caller
+    maps None → invalid_client)."""
+    if not oauth_enabled():
+        return None
+    info = validate_key(client_secret)
+    if info is None:
+        return None
+    now = int(time.time())
+    claims = {
+        "sub":       info["user_id"],
+        "tier":      info["tier"],
+        "key_id":    info["key_id"],
+        "client_id": (client_id or "").strip() or info["user_id"],
+        "iss":       OAUTH_ISSUER,
+        "iat":       now,
+        "exp":       now + JWT_TTL_SECONDS,
+        "scope":     "mcp",
+    }
+    token = _pyjwt.encode(claims, JWT_SECRET, algorithm=JWT_ALG)
+    if isinstance(token, bytes):        # PyJWT <2 returned bytes
+        token = token.decode("utf-8")
+    return {
+        "access_token": token,
+        "token_type":   "Bearer",
+        "expires_in":   JWT_TTL_SECONDS,
+        "scope":        "mcp",
+    }
+
+
+def _resolve_jwt(token: str) -> Optional[dict]:
+    """If `token` is a JWT this server signed, verify signature + expiry and
+    return caller info; otherwise None (so the caller falls back to key
+    lookup). A JWT is exactly three base64url segments, so anything without
+    two dots can't be one — skip the decode attempt entirely for raw keys."""
+    if not oauth_enabled() or token.count(".") != 2:
+        return None
+    try:
+        claims = _pyjwt.decode(
+            token, JWT_SECRET, algorithms=[JWT_ALG],
+            options={"require": ["exp", "sub"], "verify_aud": False},
+        )
+    except Exception:
+        # Bad signature / expired / malformed — not a token we honor. Fall back
+        # to treating the string as a raw key (it won't match, but that path
+        # owns the invalid-credential error message).
+        return None
+    uid = claims.get("sub")
+    if not uid:
+        return None
+    return {
+        "user_id": uid,
+        "tier":    claims.get("tier") or "free",
+        "key_id":  claims.get("key_id"),
+        "via":     "jwt",
+    }
+
+
+def resolve_bearer(token: str) -> Optional[dict]:
+    """Accept BOTH auth methods on a `Authorization: Bearer …` header:
+    an OAuth JWT (checked first — verify signature) OR a raw Forge API key
+    (fallback). Returns {user_id, tier, …} or None. This is the single entry
+    point the gating middleware uses so both paths gate identically."""
+    token = (token or "").strip()
+    if not token:
+        return None
+    via_jwt = _resolve_jwt(token)
+    if via_jwt is not None:
+        return via_jwt
+    return validate_key(token)
 
 
 # ── Rate-limit counter (atomic RPC) ──────────────────────────────────────────
@@ -194,17 +369,29 @@ def _err_invalid_key() -> ToolError:
     })
 
 
+def _err_unknown_tool(tool_name: str) -> ToolError:
+    """A tool name that doesn't exist at all — NEVER route this to the paywall.
+    A typo must read as 'unknown tool', not 'pay us'."""
+    return _err({
+        "error":   "unknown_tool",
+        "message": (f"'{tool_name}' is not a Forge tool. Call tools/list to see "
+                    f"the available tools."),
+        "tool":    tool_name,
+    })
+
+
 def _err_tier(tool_name: str, tier: str) -> ToolError:
     msg = (
-        f"{tool_name} requires Forge Pro. Try `fire_sandbox` for free "
-        f"to see the full watch→fire→settle loop (10 lifetime fires per key, "
-        f"no card), or upgrade for unlimited at {PRICING_URL}"
+        f"{tool_name} requires Forge Runtime ($999/month). Try `fire_sandbox` "
+        f"for free to see the full watch→fire→settle loop (10 lifetime fires per "
+        f"key, no card), or upgrade for unlimited at {PRICING_URL}"
     )
     return _err({
         "error":         "tool_requires_upgrade",
         "message":       msg,
         "tool":          tool_name,
         "current_tier":  tier,
+        "required_tier": "runtime",
         "free_demo":     "fire_sandbox",
         "upgrade_url":   PRICING_URL,
     })
@@ -262,11 +449,19 @@ class GatingMiddleware(Middleware):
         if not token:
             raise _err_no_auth()
 
-        info = validate_key(token)
+        # Accept a raw Forge API key OR an OAuth client-credentials JWT. JWT is
+        # verified first, then we fall back to direct key lookup — existing
+        # `Bearer forge_prod_…` clients are unaffected.
+        info = resolve_bearer(token)
         if info is None:
             raise _err_invalid_key()
 
         tier = info["tier"]
+        # Existence BEFORE paywall: a tool name we don't know is a typo / bad
+        # call, not a paid feature. Telling a developer to "upgrade" for a tool
+        # that doesn't exist is both wrong and infuriating.
+        if tool_name not in ALL_TOOLS:
+            raise _err_unknown_tool(tool_name)
         allowed_tools = ALL_TOOLS if tier == "pro" else FREE_TOOLS
         if tool_name not in allowed_tools:
             raise _err_tier(tool_name, tier)

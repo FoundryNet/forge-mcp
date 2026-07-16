@@ -1,11 +1,11 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.FoundryNet/forge-mcp",
-  "title": "FoundryNet — Industrial Machine Intelligence",
-  "description": "Industrial machine monitoring over MCP: machine identity, OPC UA / MQTT / CNC telemetry normalization, plain-English automation, and on-chain work attestation and verification.",
-  "version": "1.1.0",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.json",
+  "name": "io.github.foundrynet/forge-mcp",
+  "title": "Forge by Foundry Labs — Industrial Machine Intelligence",
+  "description": "Connect any AI agent to industrial equipment. Forge normalizes cross-manufacturer machine telemetry into one canonical schema so an agent can read, reason over, and act on data from any of 18 OEM families. 30 MCP tools for machine identity, normalization, history, plain-English automation, TimesFM prediction (forecast, threshold-breach, remaining-life, batch + fleet health, anomaly detection, full-stack machine intelligence), operations analytics (OEE, energy, shift reports, diagnostics), and tamper-evident work attestation.",
+  "version": "3.4.4",
   "repository": {
-    "url": "https://github.com/FoundryNet/forge-mcp",
+    "url": "https://github.com/foundrynet/forge-mcp",
     "source": "github"
   },
   "websiteUrl": "https://foundrynet.io",
@@ -13,33 +13,25 @@
     "industrial",
     "manufacturing",
     "machine-identity",
-    "machine-monitoring",
     "cnc",
     "plc",
     "robotics",
     "telemetry",
     "normalization",
-    "opc-ua",
-    "modbus",
-    "mqtt",
     "iot",
     "automation",
     "fanuc",
     "siemens",
     "haas",
     "dmg-mori",
-    "attestation",
-    "verification",
-    "trust",
-    "on-chain",
-    "mint",
-    "solana",
-    "agent-economy"
+    "opc-ua",
+    "modbus",
+    "attestation"
   ],
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://foundrynet-mcp-production.up.railway.app/mcp"
+      "url": "https://mcp.foundrynet.io/mcp"
     }
   ]
 }
