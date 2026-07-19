@@ -2,12 +2,12 @@
 
 The cross-manufacturer industrial MCP server. Talk to any CNC, robot, or industrial
 machine in natural language — machine identity, telemetry normalization across 18 OEM
-families, plain-English automation, and tamper-evident work attestation.
+families, plain-English automation, and tamper-evident work records.
 
 Hosted MCP over Streamable HTTP. 30 tools wrap the Forge v1 API: provision a stable machine
 identity, normalize raw OEM telemetry into a canonical schema, query operational history,
 parse and activate plain-English automations, predict failures (TimesFM), score fleet health,
-and record every state-changing action as a verifiable, tamper-evident attestation.
+and record every state-changing action as a verifiable, tamper-evident work record.
 
 - **Website:** https://foundrynet.io/?utm_source=github&utm_medium=readme&utm_campaign=forge-mcp-readme
 - **Docs:** https://foundrynet.io/docs?utm_source=github&utm_medium=readme&utm_campaign=forge-mcp-readme · **Free key:** https://foundrynet.io/signup?utm_source=github&utm_medium=readme&utm_campaign=forge-mcp-readme
@@ -22,7 +22,7 @@ It normalizes raw OEM telemetry from **18 manufacturer families** into one canon
 vocabulary with thousands of confirmed field mappings — so an agent writes against one set
 of field names whether the machine is a Fanuc CNC, a KUKA arm, or a Universal Robots cobot.
 On top of that it turns plain-English instructions into structured automations (review then
-activate), and records every state-changing action as a tamper-evident attestation.
+activate), and records every state-changing action as a tamper-evident work record.
 
 ## Architecture
 
@@ -48,8 +48,16 @@ Identity & data: `identify_machine`, `normalize_telemetry`, `query_machine_histo
 `query_webhook_history`. Prediction (TimesFM): `predict`, `predict_breach`, `remaining_life`,
 `predict_batch`, `fleet_health`, `detect_anomalies`, `machine_intelligence`,
 `prediction_accuracy`. Operations: `calculate_oee`, `fleet_oee`, `energy_consumption`,
-`shift_report`, `diagnose_machine`, `health_index`. Agents: `get_agent_card`, `list_agents`.
-Attestation: `verify_record`. Demo: `fire_sandbox` (the full watch → fire → settle loop, no card).
+`shift_report`, `diagnose_machine`, `health_index`. Agents on your kernel: `get_agent_card`,
+`list_agents`. Work records: `verify_record`. Demo: `fire_sandbox` (the full watch → fire →
+settle loop, no card).
+
+`get_agent_card` and `list_agents` are scoped to the agents connected to your kernel instance
+(their capabilities, trust scores, and machine access) and are included in your subscription —
+there is no per-call charge. They are operational tools for coordinating agents on your own
+equipment, not cross-platform discovery. For cross-platform agent trust across any framework,
+see Assay (assay.foundrynet.io). `verify_record` creates a tamper-evident, hash-verified record
+of completed work.
 
 Free tier exposes the read-only tools; metered pay-per-use unlocks the premium prediction
 and diagnostics tools (see https://forge.foundrynet.io/pricing?utm_source=github&utm_medium=readme&utm_campaign=forge-mcp-readme).
