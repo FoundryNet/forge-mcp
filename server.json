@@ -1,11 +1,11 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.json",
-  "name": "io.github.foundrynet/forge-mcp",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.FoundryNet/forge-mcp",
   "title": "Forge by Foundry Labs — Industrial Machine Intelligence",
-  "description": "Connect any AI agent to industrial equipment. Forge normalizes cross-manufacturer machine telemetry into one canonical schema so an agent can read, reason over, and act on data from any of 18 OEM families. 30 MCP tools for machine identity, normalization, history, plain-English automation, TimesFM prediction (forecast, threshold-breach, remaining-life, batch + fleet health, anomaly detection, full-stack machine intelligence), operations analytics (OEE, energy, shift reports, diagnostics), and tamper-evident, hash-verified work attestation.",
+  "description": "Connect any AI agent to industrial equipment. Forge normalizes cross-manufacturer machine telemetry into one canonical schema so an agent can read, reason over, and act on data from any of 18 OEM families. 32 MCP tools for machine identity, normalization, history, plain-English automation, TimesFM prediction (forecast, threshold-breach, remaining-life, batch + fleet health, anomaly detection, full-stack machine intelligence), operations analytics (OEE, energy, shift reports, diagnostics), deterministic safety guardrails, and tamper-evident, hash-verified work records.",
   "version": "3.4.4",
   "repository": {
-    "url": "https://github.com/foundrynet/forge-mcp",
+    "url": "https://github.com/FoundryNet/forge-mcp",
     "source": "github"
   },
   "websiteUrl": "https://foundrynet.io",
@@ -26,7 +26,8 @@
     "dmg-mori",
     "opc-ua",
     "modbus",
-    "attestation"
+    "tamper-evident",
+    "work-records"
   ],
   "remotes": [
     {

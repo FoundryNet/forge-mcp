@@ -1,4 +1,4 @@
-"""FoundryNet MCP Server — 30 tools wrapping the live Forge v1 API,
+"""FoundryNet MCP Server — 32 tools wrapping the live Forge v1 API,
 gated per-client by fnet_ tier (Free vs Pro) as of 2026-05-28.
 
 Connects any AI agent to industrial equipment over the Model Context
@@ -7,12 +7,12 @@ Protocol so any compatible agent (Claude Desktop, Cursor, etc.) can:
   - normalize raw OEM telemetry into canonical FCS data
   - query the machine's operational history
   - set up natural-language automations against canonical fields
-  - record verifiable attestations of completed work
+  - record verifiable, tamper-evident records of completed work
 
 Per-call gating (see gating.py): every tools/call must carry
 `Authorization: Bearer fnet_…` on the wire. The middleware validates the
 key against Supabase, looks up the tier (free → 12 read-only + demo tools,
-100 calls/mo; pro → all 27 tools, 10000 calls/mo), and atomically increments
+100 calls/mo; pro → all 32 tools, 10000 calls/mo), and atomically increments
 a monthly counter. Tier or rate-limit violations surface as structured
 JSON ToolError payloads with `upgrade_url: forge.foundrynet.io/pricing`.
 
@@ -38,12 +38,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 from typing import Optional
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -69,7 +71,10 @@ if not FOUNDRYNET_API_KEY:
         "Set it via the Railway dashboard before traffic hits this server."
     )
 
-mcp = FastMCP("foundrynet")
+# version= is required: without it FastMCP reports its OWN library version as
+# serverInfo.version, so the handshake advertised whatever fastmcp release was
+# built last (3.4.5) instead of ours. Keep in sync with server.json.
+mcp = FastMCP("foundrynet", version="3.4.4")
 
 # Per-client tier gating. Free keys see 7 tools (read-only + fire_sandbox +
 # correct_mapping + get_coverage, 100/mo); Pro keys see all 14 (10 000/mo).
@@ -89,6 +94,10 @@ def _headers() -> dict:
         "Authorization": f"Bearer {FOUNDRYNET_API_KEY}",
         "Content-Type":  "application/json",
         "User-Agent":    "FoundryNet-MCP/1.0",
+        # Tells forge-prod this call is an MCP proxy under the shared server key,
+        # so its cost ledger skips it — the gating middleware here logs the call
+        # under the REAL caller's key instead (no mis-attribution / double-count).
+        "X-Forge-Origin": "mcp",
     }
 
 
@@ -106,16 +115,19 @@ RETRY_DELAY_SECONDS = 2
 RETRYABLE_EXCEPTIONS = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError)
 
 
-async def _call_forge(method: str, path: str, *,
+async def _call_forge_raw(method: str, path: str, *,
                       body: Optional[dict] = None,
                       params: Optional[dict] = None) -> dict:
     """One HTTP call to Forge with one retry on transient transport errors.
 
-    Always returns a dict (never raises) so the LLM gets a structured
-    error in the tool result rather than an MCP-protocol exception. The
-    -32602 transient failures observed in early Claude Desktop sessions
-    came from upstream restarts during deploys; a single 2-second retry
-    handles them without masking persistent issues.
+    Always returns a dict (never raises). Callers that must inspect the
+    error dict (the A2A custom routes, which relay it into their own
+    JSONResponse) use this directly; MCP tool handlers use `_call_forge`,
+    the wrapper below that raises ToolError on failure so the MCP wire
+    layer sets isError=true. The -32602 transient failures observed in
+    early Claude Desktop sessions came from upstream restarts during
+    deploys; a single 2-second retry handles them without masking
+    persistent issues.
 
     Retry policy: ConnectError / ReadTimeout / RemoteProtocolError → wait
     2s and try once more. Anything else (4xx/5xx HTTP, JSON decode
@@ -132,7 +144,7 @@ async def _call_forge(method: str, path: str, *,
         except RETRYABLE_EXCEPTIONS as e:
             last_exc = e
             if attempt == 0:
-                logger.info(f"_call_forge transient {type(e).__name__} on {method} {path}, retrying in {RETRY_DELAY_SECONDS}s")
+                logger.info(f"_call_forge_raw transient {type(e).__name__} on {method} {path}, retrying in {RETRY_DELAY_SECONDS}s")
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
             return {"error": "network",
@@ -155,9 +167,35 @@ async def _call_forge(method: str, path: str, *,
     return {"error": "unreachable", "detail": str(last_exc)}
 
 
+def _raise_forge_error(result: dict) -> dict:
+    """MCP error signalling (friction F-02). `_call_forge_raw` returns a dict
+    carrying a truthy top-level `error` key on ANY failure — a non-2xx kernel
+    response (`forge_<status>`), a transport error (`network`), a decode
+    failure (`non_json_response`). Convert those into a ToolError so FastMCP
+    marks the tool result `isError=true`. Without this, agent frameworks
+    (Bedrock AgentCore, Strands, Claude) treat the error JSON as a successful
+    result and feed it to the model as data. Success bodies from the kernel
+    never carry a top-level `error` key, so this only fires on real failures.
+    The structured payload is preserved as the ToolError message so the model
+    still sees exactly what went wrong."""
+    if isinstance(result, dict) and result.get("error"):
+        raise ToolError(json.dumps(result))
+    return result
+
+
+async def _call_forge(method: str, path: str, *,
+                      body: Optional[dict] = None,
+                      params: Optional[dict] = None) -> dict:
+    """Tool-facing variant of `_call_forge_raw`: identical call, but raises
+    ToolError (isError=true) on any error result instead of returning it."""
+    return _raise_forge_error(
+        await _call_forge_raw(method, path, body=body, params=params)
+    )
+
+
 # Back-compat alias — old name `_request` was used in earlier file revisions.
-# Keep both bindings so anything in flight or in transit still works.
-_request = _call_forge
+# Bound to the raw (non-raising) variant to preserve its documented contract.
+_request = _call_forge_raw
 
 
 # ── Tool 1: identify_machine ─────────────────────────────────────────────────
@@ -185,7 +223,7 @@ async def identify_machine(
 
     USE WHEN: a user references a specific machine by OEM/model/serial and
     you need a stable handle to attach normalized data, automations, or
-    attestations to. Always call this first when a new machine is
+    tamper-evident work records to. Always call this first when a new machine is
     introduced to the conversation, before normalize_telemetry or
     create_automation.
     """
@@ -391,6 +429,59 @@ async def list_automations(machine_id: str) -> dict:
     return await _call_forge("GET", "/v1/triggers", params={"machine_id": machine_id})
 
 
+# ── Guardrails (read-only for agents) ────────────────────────────────────────
+# Guardrails are the BLOCKING counterpart to automations: an automation alerts
+# a human, a guardrail rejects the action outright and cannot be overridden by
+# an agent. Both tools here are READ-ONLY on purpose — creating, modifying, or
+# disabling a guardrail requires a human dashboard session, and the kernel
+# returns 403 to any API key that tries. Surfacing the boundaries to agents is
+# deliberate: an agent that can see the limits can stay inside them.
+
+@mcp.tool
+async def list_guardrails(machine_id: str) -> dict:
+    """List the hard safety guardrails configured on one machine.
+
+    Returns each guardrail with: id, name, the plain-English instruction it
+    was created from, its structured condition, scope, and enabled state.
+
+    Guardrails are NOT automations. An automation fires an alert and a human
+    decides; a guardrail blocks the action and nothing decides. You cannot
+    create, edit, disable, or override a guardrail through this MCP server —
+    that requires a human administrator. Attempting a write returns 403.
+
+    USE WHEN: before proposing or activating anything on a machine — "what
+    are the limits on this machine", "what am I not allowed to do here",
+    "why was my automation rejected". Reading this first is cheaper than
+    being rejected: pair it with check_guardrail to test a specific value."""
+    return await _call_forge("GET", "/v1/guardrails",
+                             params={"machine_id": machine_id})
+
+
+@mcp.tool
+async def check_guardrail(machine_id: str, proposed: dict,
+                          agent_id: Optional[str] = None) -> dict:
+    """Test whether a proposed action would be blocked, WITHOUT attempting it.
+
+    `proposed` is a dict of canonical field -> value you are considering, e.g.
+    {"spindle_speed_rpm": 13000}. Returns:
+      {"would_block": true, "guardrail": "Spindle overspeed protection",
+       "reason": "spindle_speed_rpm 13000 > limit 12000", "violations": [...]}
+    or {"would_block": false, ...} when nothing is violated.
+
+    This is a dry run: it writes nothing and is not recorded as a blocked
+    attempt. Call it BEFORE acting so you can self-correct to a safe value
+    instead of being rejected. If would_block is true, do not retry the same
+    value — adjust to satisfy the stated limit, or tell the user that a human
+    administrator must change the guardrail.
+
+    USE WHEN: you are about to recommend or set a value on a machine and want
+    to confirm it is inside the safe envelope."""
+    body: dict = {"machine_id": machine_id, "proposed": proposed}
+    if agent_id:
+        body["agent_id"] = agent_id
+    return await _call_forge("POST", "/v1/guardrails/check", body=body)
+
+
 # ── Tool 7: disable_automation ───────────────────────────────────────────────
 
 @mcp.tool
@@ -478,15 +569,16 @@ async def verify_record(
     mint_id: Optional[str] = None,
     payload: Optional[dict] = None,
     batch: bool = False,
+    on_chain: bool = False,
 ) -> dict:
     """Create a tamper-evident, independently verifiable record of work. The
-    record is hash-chained; the hash can be anchored on an external ledger when
-    configured. Two modes:
+    record is hash-chained so anyone can confirm it has not been altered.
+    Two modes:
 
     BATCH MODE (`batch=true`, requires `mint_id`):
       Collects every unsettled event for that machine — normalize calls,
       trigger fires, webhook executions — since the last batch. Computes
-      a Merkle root of their event hashes and anchors that single root as
+      a Merkle root of their event hashes and records that single root as
       one verifiable settlement. ONE settlement proves dozens to thousands
       of events. Returns: merkle_root, event_count, event_types breakdown,
       tx_signature, verify_url. Cost-efficient — call this
@@ -494,28 +586,41 @@ async def verify_record(
 
     SINGLE-PAYLOAD MODE (`batch=false`, requires `payload`):
       Hashes an arbitrary JSON `payload` deterministically (sorted keys,
-      no whitespace) and anchors the hash. Returns: payload_hash,
-      tx_signature, verify_url. Use for one-off proofs — inspection
-      records, completed work orders, signed reports — where you want a
-      permanent independent timestamp.
+      no whitespace) and records the hash. Returns: record_ref,
+      payload_hash. Use for one-off proofs — inspection records, completed
+      work orders, agent-to-agent handoffs — where you want an independent
+      timestamp you can cite later.
 
-    USE WHEN: a user wants tamper-proof evidence — settlement of a
-    completed work batch, proof a maintenance window happened, anchoring
-    a quality report, rolling up a day's machine activity into a single
-    verifiable hash. ALWAYS include the `verify_url` in your reply so the
-    user can independently verify the record.
+      Off-chain by DEFAULT (`on_chain=false`): the record is a reversible
+      database row, so it can be deleted, and creating one has no
+      settlement cost. This is the right mode for ordinary agent work
+      records. Pass `on_chain=true` to settle it permanently instead, which
+      returns a tx_signature and verify_url and CANNOT be undone.
+
+    USE WHEN: a user wants tamper-proof evidence — a completed work batch,
+    proof a maintenance window happened, a hash-verified quality report,
+    rolling up a day's machine activity into a single verifiable work
+    record. ALWAYS include the `verify_url` in your reply so the user can
+    independently verify the record.
     """
     if batch:
         if not mint_id:
-            return {"error": "bad_request",
-                    "detail": "batch=true requires mint_id"}
+            raise ToolError(json.dumps({"error": "bad_request",
+                    "detail": "batch=true requires mint_id"}))
         return await _call_forge("POST", "/v1/settle",
                               body={"mint_id": mint_id},
                               params={"batch": "true"})
     if payload is None:
-        return {"error": "bad_request",
-                "detail": "batch=false requires `payload` (any JSON object)"}
-    return await _call_forge("POST", "/v1/settle", body=payload)
+        raise ToolError(json.dumps({"error": "bad_request",
+                "detail": "batch=false requires `payload` (any JSON object)"}))
+    if on_chain:
+        # Explicit opt-in: permanent settlement, returns tx_signature.
+        return await _call_forge("POST", "/v1/settle", body=payload)
+    # Default: off-chain, reversible proof-of-existence. An agent recording a
+    # routine handoff should not be silently committing to an irreversible
+    # settlement — that has to be asked for.
+    return await _call_forge("POST", "/v1/verify_record",
+                             body={"payload": payload, "machine_id": mint_id})
 
 
 # Retired MCP tool (2026-07-10): no longer decorated with @mcp.tool, so it is
@@ -528,8 +633,12 @@ async def verify_on_chain(
     payload: Optional[dict] = None,
     batch: bool = False,
 ) -> dict:
-    """Retired alias for verify_record (no longer exposed as an MCP tool)."""
-    return await verify_record(mint_id=mint_id, payload=payload, batch=batch)
+    """Retired alias for verify_record (no longer exposed as an MCP tool).
+
+    Its name promised on-chain settlement, so it keeps that behaviour rather
+    than inheriting verify_record's new off-chain default."""
+    return await verify_record(mint_id=mint_id, payload=payload, batch=batch,
+                               on_chain=True)
 
 
 # ── Tool 12: fire_sandbox — FREE-tier demo of the full action loop ────────
@@ -552,8 +661,8 @@ async def fire_sandbox(
 
     The MCP server POSTs `{message, condition: condition_text, ts}` to its
     own /sandbox/echo route — a real HTTP round-trip with a real response
-    body — then hashes the response and records a verifiable attestation of
-    it. Returns the echo body, the tx_signature, and a verify_url.
+    body — then hashes the response and records a tamper-evident, verifiable
+    work record of it. Returns the echo body, the tx_signature, and a verify_url.
 
     USE WHEN: a developer is evaluating Forge and wants to feel the full
     loop (a webhook actually fires, a real settlement actually records, the
@@ -585,8 +694,8 @@ async def fire_sandbox(
         echo_status = wr.status_code
         echo_body = wr.text
     except Exception as e:
-        return {"error": "sandbox_webhook_failed",
-                "detail": f"{type(e).__name__}: {e}"}
+        raise ToolError(json.dumps({"error": "sandbox_webhook_failed",
+                "detail": f"{type(e).__name__}: {e}"}))
 
     # 2) Hash the action+inputs+outputs deterministically.
     canonical = _json.dumps(
@@ -606,7 +715,7 @@ async def fire_sandbox(
         "tx_signature": settle.get("tx_signature"),
         "verify_url":   settle.get("verify_url"),
         "note": (
-            "Demo loop verified — the verify_url is a real attestation anchor. "
+            "Demo loop verified — the verify_url is a real tamper-evident work record. "
             "Lifetime cap 10/key. Upgrade for unlimited + real-machine "
             "automations at https://forge.foundrynet.io/pricing"
         ),
@@ -739,7 +848,7 @@ async def predict_breach(
     quantile-derived breach_window {earliest, latest}. Every result carries a
     deterministic data_hash so the prediction is cryptographically provable. Pass
     a caller-owned `mint_id` to write an audit event tying the prediction to a
-    specific machine; add `settle=true` to anchor it as a verifiable settlement
+    specific machine; add `settle=true` to record it as a verifiable settlement
     for an insurance-grade, tamper-evident record.
 
     Args:
@@ -748,7 +857,7 @@ async def predict_breach(
       canonical_field  FCS field the series represents (e.g. "spindle_load_pct")
       direction        "above" (default) or "below" — which side is the breach
       horizon          steps to look ahead (1–256, default 96)
-      mint_id          caller-owned machine to anchor provenance to (optional)
+      mint_id          caller-owned machine to record provenance to (optional)
       settle           if true and mint_id is owned, record a verifiable settlement (costs a fee)
 
     USE WHEN: a user asks if/when a limit will be hit — "will spindle load breach
@@ -1046,12 +1155,18 @@ async def diagnose_machine(
 
 @mcp.tool
 async def get_agent_card(agent_id: Optional[str] = None) -> dict:
-    """Retrieve an agent's identity card — capabilities, trust scores, governance
-    constraints, and verified work history. Trust scores are COMPUTED from the
-    kernel's attested history, not self-reported, so they can't be inflated.
+    """Get the credentials and trust score of an agent connected to this kernel —
+    its capabilities, computed trust score, governance constraints, and verified
+    work history on this kernel. Trust scores are COMPUTED from this kernel's own
+    verified work history, not self-reported, so they can't be inflated.
+
+    Scoped to agents connected to this kernel instance; included in your
+    subscription (no per-call charge). For cross-platform agent trust across any
+    framework, see Assay (assay.foundrynet.io).
 
     USE WHEN your agent needs to present its credentials to a facility operator,
-    or to evaluate another agent's qualifications before coordinating work.
+    or to check another agent connected to this kernel before coordinating work
+    on your equipment.
 
     Args:
       agent_id  the connected agent's id. Omit to get the built-in Forge
@@ -1064,14 +1179,19 @@ async def get_agent_card(agent_id: Optional[str] = None) -> dict:
 async def list_agents(capability: Optional[str] = None,
                       min_trust_score: Optional[float] = None,
                       machine_id: Optional[str] = None) -> dict:
-    """Discover other agents connected to this kernel — their capabilities, trust
-    scores, and machine access. Trust is COMPUTED from attested history, not
-    self-reported, so it can't be gamed.
+    """List other agents connected to this kernel instance — their capabilities,
+    trust scores, and machine access. Trust is COMPUTED from this kernel's own
+    verified work history, not self-reported, so it can't be gamed.
 
-    USE WHEN your agent needs to find another agent with a specific capability to
-    coordinate with or delegate work to — e.g. a monitoring agent that detected a
-    bearing fault finding a maintenance agent qualified to fix it. Compare the
-    returned cards (trust, jobs, first-fix rate) before selecting one.
+    Scoped to agents connected to this kernel instance; included in your
+    subscription (no per-call charge). For cross-platform agent trust across any
+    framework, see Assay (assay.foundrynet.io).
+
+    USE WHEN your agent needs to find another agent connected to this kernel with
+    a specific capability to coordinate with or delegate work to — e.g. a
+    monitoring agent that detected a bearing fault finding a maintenance agent
+    qualified to fix it. Compare the returned cards (trust, jobs, first-fix rate)
+    before selecting one.
 
     Args:
       capability       keyword filter on capabilities (e.g. "bearing",
@@ -1186,7 +1306,7 @@ async def server_card(request: Request) -> JSONResponse:
                 "Bosch Rexroth — backed by 18,785+ canonical field mappings. "
                 "When a condition matches, Forge fires the webhook or alert "
                 "you wired (Slack, Teams, PagerDuty, your MES, your own "
-                "endpoint) and records a tamper-evident attestation of the "
+                "endpoint) and logs a tamper-evident record of the "
                 "action. The agent watches; you stay in the loop."
             ),
             # Smithery (and MCP-canonical) — lets the publish skip its scan.
@@ -1251,6 +1371,10 @@ async def server_card(request: Request) -> JSONResponse:
                  "description": "Activate a parsed trigger so it fires its registered actions when the condition matches canonical telemetry."},
                 {"name": "list_automations",
                  "description": "List the active trigger automations configured for a machine, with their conditions and actions."},
+                {"name": "list_guardrails",
+                 "description": "List the hard safety guardrails on a machine. Guardrails block rather than alert, and cannot be created or overridden by an agent."},
+                {"name": "check_guardrail",
+                 "description": "Dry-run a proposed value against a machine's guardrails and get would_block plus the reason, without attempting the action."},
                 {"name": "disable_automation",
                  "description": "Pause an active trigger without deleting it; configuration and history are preserved."},
                 {"name": "delete_automation",
@@ -1260,9 +1384,9 @@ async def server_card(request: Request) -> JSONResponse:
                 {"name": "query_webhook_history",
                  "description": "Webhook delivery history for a trigger — HTTP status, retries, response times, and attestation signatures."},
                 {"name": "verify_record",
-                 "description": "Create a tamper-evident, independently verifiable record of work (hash-chained; optionally anchored). Returns a record hash and a verify URL."},
+                 "description": "Create a tamper-evident, independently verifiable, hash-chained record of work. Returns a record hash and a verify URL."},
                 {"name": "fire_sandbox",
-                 "description": "FREE-tier demo: fires a sample condition at the built-in /sandbox/echo endpoint, captures the response, and records a tamper-evident attestation. Demonstrates the full watch→fire→settle loop end-to-end. Lifetime cap: 10 fires per fnet_ key — no credit card required."},
+                 "description": "FREE-tier demo: fires a sample condition at the built-in /sandbox/echo endpoint, captures the response, and records a tamper-evident work record. Demonstrates the full watch→fire→settle loop end-to-end. Lifetime cap: 10 fires per fnet_ key — no credit card required."},
                 {"name": "correct_mapping",
                  "description": "FREE: teach Forge the right canonical field when normalize_telemetry mapped a column wrong or abstained. Each correction is a corpus-improvement signal feeding an offline retrain."},
                 {"name": "get_coverage",
@@ -1270,9 +1394,9 @@ async def server_card(request: Request) -> JSONResponse:
                 {"name": "predict",
                  "description": "PREMIUM: forecast the next N readings of a canonical telemetry series via TimesFM — point forecast plus quantile uncertainty bands, no per-machine training."},
                 {"name": "predict_breach",
-                 "description": "PREMIUM: the parametric-insurance primitive — predict whether/when a canonical series crosses a threshold, with a quantile breach window and a provable data_hash (optionally attested)."},
+                 "description": "PREMIUM: the parametric-insurance primitive — predict whether/when a canonical series crosses a threshold, with a quantile breach window and a provable data_hash (optionally recorded as a tamper-evident settlement)."},
                 {"name": "remaining_life",
-                 "description": "PREMIUM: estimate remaining useful life before a failure threshold, with a maintenance recommendation (immediate/schedule/monitor/healthy) and the same attestation provenance as predict_breach."},
+                 "description": "PREMIUM: estimate remaining useful life before a failure threshold, with a maintenance recommendation (immediate/schedule/monitor/healthy) and the same tamper-evident provenance as predict_breach."},
                 {"name": "predict_batch",
                  "description": "PREMIUM: fleet-scale prediction — score up to 100 machines in one call, returning a fleet health score, at-risk count, and a top-5 maintenance priority queue. $0.02/machine."},
                 {"name": "fleet_health",
@@ -1280,7 +1404,7 @@ async def server_card(request: Request) -> JSONResponse:
                 {"name": "detect_anomalies",
                  "description": "PREMIUM: statistical anomaly detection (z-score + IQR + trend/acceleration) with no ML inference — fast, cheap, real-time monitoring on series as short as 4 points. $0.02/call."},
                 {"name": "machine_intelligence",
-                 "description": "PREMIUM: the full stack in one call — normalize field names, detect anomalies, forecast, predict breaches, score health (A–F grade), and build a maintenance queue, all attested. $0.25/call."},
+                 "description": "PREMIUM: the full stack in one call — normalize field names, detect anomalies, forecast, predict breaches, score health (A–F grade), and build a maintenance queue, all with tamper-evident provenance. $0.25/call."},
                 {"name": "prediction_accuracy",
                  "description": "FREE: trust signal — reports tracked prediction accuracy (breach accuracy %, forecast MAE, per-field breakdown) so an agent can gauge forecast quality before paying."},
                 {"name": "calculate_oee",
@@ -1296,13 +1420,13 @@ async def server_card(request: Request) -> JSONResponse:
                 {"name": "health_index",
                  "description": "Composite multi-sensor health index (0-1) for a machine with trend and per-field contributors — surfaces slow degradation a single-threshold check misses."},
                 {"name": "get_agent_card",
-                 "description": "Return the calling agent's identity card: usage-derived trust scores, query/action counts, and attestation summary. Meta/credentials tool."},
+                 "description": "Return the identity card of an agent connected to this kernel: usage-derived trust score, query/action counts, and verified work summary. Meta/credentials tool, scoped to this kernel instance and included in your subscription."},
                 {"name": "list_agents",
-                 "description": "Discover other agents connected to this kernel, filtered by capability, minimum trust score, and machine access. For agent-to-agent coordination and work delegation."},
+                 "description": "List other agents connected to this kernel instance, filtered by capability, minimum trust score, and machine access. For coordination and work delegation between agents on this kernel; included in your subscription."},
             ],
             "categories": [
                 "industrial", "manufacturing", "iot",
-                "automation", "attestation",
+                "automation", "tamper-evident",
             ],
             # Pay-per-use metered billing (Stripe Meter Events — wired in
             # billing.py). No flat monthly tier; the bill is whatever you
@@ -1425,12 +1549,15 @@ async def _a2a_dispatch(skill_id: str, params: dict) -> Optional[dict]:
     """Map an A2A skill_id to the same kernel call its MCP tool makes.
     Returns None for an unknown skill."""
     params = params or {}
+    # Custom routes relay the error dict into their own JSONResponse (see
+    # a2a_create_task's `failed` check), so they use the raw, non-raising
+    # variant rather than the ToolError-raising `_call_forge`.
     if skill_id == "normalize_telemetry":
         body: dict = {"data": params.get("data", {})}
         for k in ("machine_id", "oem", "model", "serial", "site"):
             if params.get(k) is not None:
                 body[k] = params[k]
-        return await _call_forge("POST", "/v1/normalize", body=body)
+        return await _call_forge_raw("POST", "/v1/normalize", body=body)
     if skill_id == "predict_failure":
         body = {"time_series": params.get("time_series", []),
                 "threshold": params.get("threshold"),
@@ -1441,9 +1568,9 @@ async def _a2a_dispatch(skill_id: str, params: dict) -> Optional[dict]:
             body["canonical_field"] = params["canonical_field"]
         if params.get("mint_id") is not None:
             body["mint_id"] = params["mint_id"]
-        return await _call_forge("POST", "/v1/predict_breach", body=body)
+        return await _call_forge_raw("POST", "/v1/predict_breach", body=body)
     if skill_id == "fleet_intelligence":
-        return await _call_forge("POST", "/v1/fleet_health",
+        return await _call_forge_raw("POST", "/v1/fleet_health",
                                  body={"machines": params.get("machines", [])})
     if skill_id == "diagnose":
         mid = params.get("machine_id")
@@ -1453,13 +1580,13 @@ async def _a2a_dispatch(skill_id: str, params: dict) -> Optional[dict]:
         for k in ("event_time", "symptom"):
             if params.get(k) is not None:
                 body[k] = params[k]
-        return await _call_forge("POST", f"/v1/diagnose/{mid}", body=body)
+        return await _call_forge_raw("POST", f"/v1/diagnose/{mid}", body=body)
     if skill_id == "agent_trust":
         qp: dict = {}
         for k in ("capability", "min_trust_score", "machine_id"):
             if params.get(k) is not None:
                 qp[k] = params[k]
-        return await _call_forge("GET", "/v1/agents/discover", params=qp)
+        return await _call_forge_raw("GET", "/v1/agents/discover", params=qp)
     return None
 
 
@@ -1471,7 +1598,7 @@ async def wellknown_a2a_agent_json(request: "Request") -> JSONResponse:
         "description": ("Industrial AI infrastructure. Connects AI agents to industrial "
                         "equipment through 14 protocols. Cross-OEM normalization, "
                         "physics-validated readings, health index, failure prediction, "
-                        "and agent trust scoring."),
+                        "and trust scoring for agents connected to this kernel."),
         "url": "https://mcp.foundrynet.io",
         "version": "3.4.4",
         "capabilities": {"streaming": True, "pushNotifications": False,
@@ -1504,10 +1631,11 @@ async def wellknown_a2a_agent_json(request: "Request") -> JSONResponse:
              "examples": ["Diagnose why vibration is increasing",
                           "Identify cause of temperature spike",
                           "Explain bearing degradation pattern"]},
-            {"id": "agent_trust", "name": "Agent Trust Scoring",
-             "description": ("Verified trust scores for connected agents computed from "
-                             "attested operational data. Discover agents by capability "
-                             "and trust threshold."),
+            {"id": "agent_trust", "name": "Connected-Agent Trust Scoring",
+             "description": ("Trust scores for agents connected to this kernel, computed "
+                             "from this kernel's own verified operational history. Discover "
+                             "connected agents by capability and trust threshold. Scoped to "
+                             "this kernel; for cross-platform agent trust see Assay."),
              "tags": ["trust", "identity", "governance", "a2a"],
              "examples": ["Find maintenance agents with >0.85 trust",
                           "Get trust score breakdown for an agent",
@@ -1579,7 +1707,7 @@ async def a2a_list_agents(request: "Request") -> JSONResponse:
             pass
     if mid:
         qp["machine_id"] = mid
-    discovered = await _call_forge("GET", "/v1/agents/discover", params=qp)
+    discovered = await _call_forge_raw("GET", "/v1/agents/discover", params=qp)
     # The kernel returns the agent list; relay it and add A2A-shaped cards.
     agents = []
     if isinstance(discovered, dict):
@@ -1705,6 +1833,25 @@ def build_dual_app():
             async with sse_life(app):
                 yield
     main_app.router.lifespan_context = _dual_lifespan
+    # M4: raw-origin lockdown. Reject requests that did not arrive through
+    # Cloudflare (i.e. missing the Transform-Rule-injected shared secret) before
+    # they reach any route. OFF until ORIGIN_SHARED_SECRET is set, so deploying is
+    # safe; /health is exempt. Lower-criticality here than forge/assay (mcp tool
+    # calls already require a valid key and its cap is per-user, not per-IP), but
+    # applied for edge-consistency.
+    import hmac as _hmac
+    from starlette.middleware.base import BaseHTTPMiddleware
+    _secret = os.environ.get("ORIGIN_SHARED_SECRET", "").strip()
+
+    class _OriginGuard(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            if _secret and not request.url.path.startswith("/health"):
+                presented = (request.headers.get("x-forge-origin-key") or "").strip()
+                if not (presented and _hmac.compare_digest(presented, _secret)):
+                    return JSONResponse({"error": "bad_request"}, status_code=400)
+            return await call_next(request)
+
+    main_app.add_middleware(_OriginGuard)
     return main_app
 
 

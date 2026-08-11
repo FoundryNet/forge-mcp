@@ -1,4 +1,8 @@
-fastmcp>=2.0
+# Pinned <4: FastMCP 4.x is the 2026-07-28 (stateless) spec line and drops the
+# 3.x compat shims + server-side sampling/roots. Prod runs 3.4.5. Do not relax
+# this bound without migrating build_dual_app() and the tool surface first.
+fastmcp>=3.4.5,<4
 httpx>=0.27
 supabase>=2.7
 PyJWT>=2.8
+stripe>=11.0

@@ -4,7 +4,7 @@ The cross-manufacturer industrial MCP server. Talk to any CNC, robot, or industr
 machine in natural language — machine identity, telemetry normalization across 18 OEM
 families, plain-English automation, and tamper-evident work records.
 
-Hosted MCP over Streamable HTTP. 30 tools wrap the Forge v1 API: provision a stable machine
+Hosted MCP over Streamable HTTP. 32 tools wrap the Forge v1 API: provision a stable machine
 identity, normalize raw OEM telemetry into a canonical schema, query operational history,
 parse and activate plain-English automations, predict failures (TimesFM), score fleet health,
 and record every state-changing action as a verifiable, tamper-evident work record.
@@ -40,7 +40,7 @@ Claude Desktop / agent
   forge.foundrynet.io/v1/*
 ```
 
-## Tools (30)
+## Tools (32)
 
 Identity & data: `identify_machine`, `normalize_telemetry`, `query_machine_history`,
 `get_coverage`, `correct_mapping`. Automation: `create_automation`, `activate_automation`,
@@ -48,7 +48,8 @@ Identity & data: `identify_machine`, `normalize_telemetry`, `query_machine_histo
 `query_webhook_history`. Prediction (TimesFM): `predict`, `predict_breach`, `remaining_life`,
 `predict_batch`, `fleet_health`, `detect_anomalies`, `machine_intelligence`,
 `prediction_accuracy`. Operations: `calculate_oee`, `fleet_oee`, `energy_consumption`,
-`shift_report`, `diagnose_machine`, `health_index`. Agents on your kernel: `get_agent_card`,
+`shift_report`, `diagnose_machine`, `health_index`. Guardrails: `check_guardrail`,
+`list_guardrails`. Agents on your kernel: `get_agent_card`,
 `list_agents`. Work records: `verify_record`. Demo: `fire_sandbox` (the full watch → fire →
 settle loop, no card).
 
@@ -102,7 +103,7 @@ Get a free `fnet_` key at https://foundrynet.io/signup?utm_source=github&utm_med
 
 ## Files
 
-- `mcp_server.py` — the server (30 tools + `/health` + `/.well-known/mcp` routes)
+- `mcp_server.py` — the server (32 tools + `/health` + `/.well-known/mcp` routes)
 - `gating.py` — per-client tier gating (Free vs Pro tool/quota enforcement)
 - `server.json` — MCP registry metadata (name, description, keywords, remote endpoint)
 - `smithery.yaml` — Smithery listing metadata
