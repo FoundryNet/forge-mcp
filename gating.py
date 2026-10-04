@@ -4,12 +4,12 @@ Until now every client of foundrynet-mcp-production shared one upstream
 FOUNDRYNET_API_KEY. This module flips that: each MCP client presents its
 own `Authorization: Bearer fnet_…` header on every tool call, we validate
 the key against Supabase, look up its tier, gate the requested tool
-against a tier→tools allowlist, and atomically check+increment a monthly
-usage counter against the per-tier cap.
+against a tier→tools allowlist, and atomically check+increment a windowed
+usage counter against the per-tier cap (free = hourly, pro = monthly).
 
 Two tiers (Enterprise + attest_machine_action are deferred):
   • Free  — 7 tools (normalize + read-only history/coverage + fire_sandbox demo
-            + corpus-feedback), 100 calls/month. Free keys are minted self-serve
+            + corpus-feedback), 100 calls/HOUR. Free keys are minted self-serve
             via /v1/keys (no Stripe binding); `free_tier=true` in forge_api_keys.
             Demo (chat-minted) keys also fall here.
   • Pro   — all 29 deployed tools, 10 000 calls/month. Any active
@@ -28,6 +28,8 @@ call but log) rather than 503'ing a paying customer's workflow.
 """
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -55,8 +57,14 @@ logger = logging.getLogger("foundrynet.mcp.gating")
 # machine, check coverage, correct a mapping, read an agent card, and discover
 # other agents — all on a free sandbox key over MCP. These mirror the free
 # surface of the REST API so MCP and REST agree on what "free" means.
+# ALIGNED TO the published rate card (forge-prod/static/pricing.html) 2026-07-27:
+# every tool the page prices at $0.00 is callable on the free tier. This set is a
+# SUPERSET of the page's free column by design — normalize_telemetry ($0.01),
+# fire_sandbox and query_webhook_history stay here as the trial allowance, since
+# free-tier access is metered by the 100-calls/hour cap, not by per-call price.
+# A tool being in this set is NOT a claim that it costs $0; TOOL_COSTS is.
 FREE_TOOLS: frozenset[str] = frozenset({
-    "normalize_telemetry",     # THE first-value call — normalize any OEM's telemetry
+    "normalize_telemetry",     # THE first-value call — trial allowance, priced $0.01
     "identify_machine",        # register/identify a machine — discovery, free
     "get_coverage",            # pre-flight schema introspection (the "get_schema" need)
     "correct_mapping",         # corpus-improvement signal — free so every interaction trains the corpus
@@ -64,30 +72,41 @@ FREE_TOOLS: frozenset[str] = frozenset({
     "list_agents",             # agent discovery — free so agents can find each other to coordinate
     "query_machine_history",   # spec: query_machine_data + get_machine_history
     "list_automations",        # spec: get_integrations (lists configured automations)
+    "create_automation",       # spec: create_trigger — free per rate card
+    "activate_automation",     # spec: execute_action — free per rate card
+    "list_guardrails",         # safety boundaries are NEVER paywalled
+    "check_guardrail",         # dry-run safety check — free so agents always pre-check
     "query_webhook_history",   # spec: get_integrations (delivery / status)
     "fire_sandbox",            # demo-to-conversion unlock: full loop, 10 fires/key lifetime
+    "prediction_accuracy",     # forecast-quality trust signal — free per rate card
+    "calculate_oee",           # OEE analytics — free per rate card
+    "fleet_oee",               # whole-floor OEE — free per rate card
+    "energy_consumption",      # energy + cost per machine — free per rate card
+    "shift_report",            # shift handover summary — free per rate card
+    "detect_anomalies",        # z-score/IQR outliers — no ML inference, free
 })
 ALL_TOOLS: frozenset[str] = FREE_TOOLS | frozenset({
-    "create_automation",       # spec: create_trigger (Pro)
-    "activate_automation",     # spec: execute_action (Pro)
     "disable_automation",
     "delete_automation",
     "restore_automation",
-    "verify_record",           # spec: settle_machine_work (Pro) — canonical settle tool
-    "predict",                 # TimesFM forecast (Pro — runs ML inference, ~$0.05/call)
-    "predict_breach",          # parametric-insurance threshold-breach primitive (Pro)
-    "remaining_life",          # remaining-useful-life estimate (Pro)
-    "predict_batch",           # fleet-scale batch prediction (Pro — $0.02/machine)
-    "fleet_health",            # fleet health dashboard (Pro — $0.50/assessment)
-    "detect_anomalies",        # statistical anomaly detection (Pro — $0.02, no ML inference)
-    "machine_intelligence",    # full-stack machine analysis (Pro — $0.25/call)
-    "diagnose_machine",        # LLM root-cause analysis (Pro — $0.25/call)
-    "prediction_accuracy",     # Pro — forecast-quality trust signal
-    "calculate_oee",           # Pro — OEE analytics
-    "fleet_oee",               # Pro — whole-floor OEE
-    "energy_consumption",      # Pro — energy + cost per machine
-    "shift_report",            # Pro — shift handover summary
-    "health_index",            # Pro — composite multi-sensor health
+    "verify_record",           # spec: settle_machine_work (Pro — $0.02/call)
+    "predict",                 # TimesFM forecast (Pro — runs ML inference, $0.10/call)
+    "predict_breach",          # parametric-insurance threshold-breach primitive (Pro — $0.10)
+    "remaining_life",          # remaining-useful-life estimate (Pro — $0.10/call)
+    "health_index",            # composite multi-sensor health (Pro — $0.10/call)
+    "diagnose_machine",        # LLM root-cause analysis (Pro — $0.10/call)
+    "fleet_health",            # fleet health dashboard (Pro — $0.20/assessment)
+    "predict_batch",           # fleet-scale batch prediction (Pro — $0.20/call)
+    "machine_intelligence",    # full-stack analysis (FREE to predict-entitled keys)
+})
+
+# Tools that are free on EVERY tier, including a metered account with no card on
+# file. Mirrors forge-prod's free_tools exactly. A metered (fnet_) key without a
+# payment method is limited to these — every other tool returns payment_required,
+# identical to the REST 402. (The free/sandbox tier still gets the wider
+# FREE_TOOLS set, including normalize, up to its hourly allowance.)
+TRULY_FREE_TOOLS: frozenset[str] = frozenset({
+    "identify_machine", "get_coverage", "correct_mapping", "get_agent_card",
 })
 
 FREE_CAP = int(os.environ.get("MCP_FREE_CAP", "100"))
@@ -109,6 +128,40 @@ SIGNUP_URL  = os.environ.get("MCP_SIGNUP_URL",  "https://forge.foundrynet.io/")
 
 API_KEY_PREFIX = "fnet_"   # legacy default — kept for cosmetic error-message refs
 
+# ── Caller identity for upstream metering ────────────────────────────────────
+# Every tool call is proxied to forge-prod under this server's single shared
+# FOUNDRYNET_API_KEY, so forge-prod used to meter its owner — a billing_exempt,
+# cardless key — and every paid MCP tool collected $0.00. forge-prod now accepts
+# `X-Forge-Caller-Key-Id` and meters that subject instead.
+#
+# The value is `forge_api_keys.id` — the ROW ID that log_usage() is already
+# keyed on. NEVER the key, its prefix, or its hash: this header crosses the
+# wire on every upstream call, so a secret on it would be a new leak surface.
+#
+# A ContextVar (not a module-level global, not an attribute on a shared object)
+# because this process serves concurrent tool calls: a global would let call B
+# overwrite call A's id between A's gate and A's upstream request, and the
+# upstream request is the only place the id is read. ContextVars are per-task,
+# so each in-flight call reads its own.
+_caller_key_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "forge_mcp_caller_key_id", default="")
+
+
+def current_caller_key_id() -> str:
+    """forge_api_keys.id of the key behind the in-flight tools/call, or "".
+
+    Returns "" (never None) when there is no identified caller — an
+    unauthenticated path, a non-MCP HTTP route, or a bare import. The header
+    is still SENT empty: forge-prod fails CLOSED on an empty/absent caller id
+    (`meter_unattributed ... reason=mcp_caller_unidentified`), which is the
+    intended outcome, whereas omitting the header entirely would be
+    indistinguishable from an older proxy build.
+    """
+    try:
+        return _caller_key_id.get() or ""
+    except LookupError:      # no default bound in this context
+        return ""
+
 # Every Forge key namespace the MCP server accepts. It used to be fnet_-only,
 # which rejected every forge_prod_/forge_sandbox_/forge_monitor_/forge_agent_
 # key the main product now mints — i.e. a paying Runtime customer's key was
@@ -128,7 +181,9 @@ ACCEPTED_KEY_PREFIXES = ("fnet_", "forge_prod_", "forge_sandbox_",
 # half-configured deploy degrades to today's key-only behavior, never a 500.
 JWT_SECRET      = (os.environ.get("MCP_JWT_SECRET") or "").strip()
 JWT_ALG         = "HS256"
-JWT_TTL_SECONDS = int(os.environ.get("MCP_JWT_TTL", "3600"))   # 1 hour
+JWT_TTL_SECONDS = int(os.environ.get("MCP_JWT_TTL", "900"))    # 15 min (M8: bound the
+#   window in which a revoked key's already-minted token can still be used, even
+#   if the per-call revocation re-check below fails open during a DB outage).
 OAUTH_ISSUER    = (os.environ.get("MCP_OAUTH_ISSUER")
                    or "https://mcp.foundrynet.io").rstrip("/")
 
@@ -167,6 +222,23 @@ def _hash_api_key(token: str) -> str:
 
 def _current_month_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _current_hour_utc() -> str:
+    """Bucket key for an HOURLY window, e.g. '2026-08-24T19'.
+
+    The free tier is 100 calls per HOUR — that is what the kernel's rate limiter
+    enforces on forge.foundrynet.io and what the signup page advertises. MCP was
+    counting the same 100 calls per MONTH against its own counter, so one key
+    meant two tiers 720x apart depending on which transport you used, and the
+    402 text said so out loud ("100 calls/month"). Same key, same tier, same
+    window, whichever door you knock on.
+
+    forge_mcp_usage.month is a TEXT primary-key component, so an hourly bucket
+    needs no migration — only a different string. Old '2026-08' rows simply stop
+    being written to and age out.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
 
 
 # ── Key validation + tier resolution ─────────────────────────────────────────
@@ -219,7 +291,7 @@ def validate_key(token: str) -> Optional[dict]:
     try:
         h = _hash_api_key(token)
         r = (client.table("forge_api_keys")
-             .select("id,user_id,status,is_demo,free_tier,plan,"
+             .select("id,user_id,status,is_demo,free_tier,plan,stripe_customer_id,"
                      "stripe_subscription_id,rotation_grace_until,expires_at")
              .eq("key_hash", h)
              .in_("status", ["active", "rotating"])
@@ -242,7 +314,17 @@ def validate_key(token: str) -> Optional[dict]:
         grace = _parse_ts(row.get("rotation_grace_until"))
         if grace is None or now > grace:
             return None
-    return {"user_id": row["user_id"], "tier": _tier_for_row(row), "key_id": row["id"]}
+    return {
+        "user_id":            row["user_id"],
+        "tier":               _tier_for_row(row),
+        "key_id":             row["id"],
+        # Plan + customer let the middleware apply the SAME payment-method gate
+        # forge-prod applies on REST, so a metered (fnet_) key can't run paid
+        # tools free over MCP. forge_agent_ keys inherit the parent plan but
+        # carry no customer of their own — resolved from the account downstream.
+        "plan":               (row.get("plan") or "").strip().lower(),
+        "stripe_customer_id": row.get("stripe_customer_id"),
+    }
 
 
 # ── OAuth: mint + verify JWT access tokens ───────────────────────────────────
@@ -262,6 +344,10 @@ def issue_access_token(client_id: str, client_secret: str) -> Optional[dict]:
         "sub":       info["user_id"],
         "tier":      info["tier"],
         "key_id":    info["key_id"],
+        # Carry the billing context so the payment-method gate applies to OAuth
+        # callers exactly as it does to raw-key callers (bounded by the short TTL).
+        "plan":      info.get("plan") or "",
+        "cust":      info.get("stripe_customer_id"),
         "client_id": (client_id or "").strip() or info["user_id"],
         "iss":       OAUTH_ISSUER,
         "iat":       now,
@@ -299,12 +385,57 @@ def _resolve_jwt(token: str) -> Optional[dict]:
     uid = claims.get("sub")
     if not uid:
         return None
+    # M8: a JWT is only as trustworthy as the key it was minted from. Re-check
+    # that the underlying key has not been revoked since — otherwise a revoked
+    # key's token would stay valid for its whole TTL. Fail-open on DB error to
+    # match this module's availability-first posture (the shortened TTL bounds
+    # that window); fail-closed on a definitive "key no longer live".
+    if not _key_id_live(claims.get("key_id")):
+        return None
     return {
-        "user_id": uid,
-        "tier":    claims.get("tier") or "free",
-        "key_id":  claims.get("key_id"),
-        "via":     "jwt",
+        "user_id":            uid,
+        "tier":               claims.get("tier") or "free",
+        "key_id":             claims.get("key_id"),
+        "plan":               (claims.get("plan") or "").strip().lower(),
+        "stripe_customer_id": claims.get("cust"),
+        "via":                "jwt",
     }
+
+
+def _key_id_live(key_id: Optional[str]) -> bool:
+    """True if forge_api_keys row `key_id` is still usable (active, or rotating
+    within grace, and not past hard expiry). Mirrors validate_key's liveness
+    rules but keyed on the id carried in a JWT. Fail-OPEN on DB unreachability
+    (return True) so a momentary outage doesn't break paying clients; fail-CLOSED
+    (return False) on a definitive revoked/expired/missing row."""
+    if not key_id:
+        return False
+    client = _supabase()
+    if client is None:
+        return True  # can't check → don't break auth (TTL bounds exposure)
+    try:
+        r = (client.table("forge_api_keys")
+             .select("id,status,rotation_grace_until,expires_at")
+             .eq("id", key_id)
+             .in_("status", ["active", "rotating"])
+             .limit(1)
+             .execute())
+    except Exception as e:
+        logger.warning(f"gating: _key_id_live failure: {type(e).__name__}: {e}")
+        return True  # DB error → fail open
+    rows = r.data or []
+    if not rows:
+        return False  # revoked / deleted / status no longer active|rotating
+    row = rows[0]
+    now = datetime.now(timezone.utc)
+    exp = _parse_ts(row.get("expires_at"))
+    if exp is not None and now > exp:
+        return False
+    if row.get("status") == "rotating":
+        grace = _parse_ts(row.get("rotation_grace_until"))
+        if grace is None or now > grace:
+            return False
+    return True
 
 
 def resolve_bearer(token: str) -> Optional[dict]:
@@ -323,18 +454,28 @@ def resolve_bearer(token: str) -> Optional[dict]:
 
 # ── Rate-limit counter (atomic RPC) ──────────────────────────────────────────
 
+def window_for(tier: str) -> str:
+    """The window a tier's cap is measured over: free is hourly, pro monthly."""
+    return "month" if tier == "pro" else "hour"
+
+
 def check_and_increment(user_id: str, tier: str) -> tuple[bool, int, int]:
-    """Atomically check the monthly cap, then increment if under it.
-    Returns (allowed, new_call_count, cap). Fails OPEN on Supabase errors
-    so a momentary outage never breaks paying clients."""
-    cap = PRO_CAP if tier == "pro" else FREE_CAP
+    """Atomically check the tier's cap, then increment if under it.
+
+    Free is capped per HOUR (matching the kernel's limiter and the signup page);
+    Pro stays per MONTH, which is its contract. Returns (allowed,
+    new_call_count, cap). Fails OPEN on Supabase errors so a momentary outage
+    never breaks paying clients."""
+    is_pro = tier == "pro"
+    cap = PRO_CAP if is_pro else FREE_CAP
+    bucket = _current_month_utc() if is_pro else _current_hour_utc()
     client = _supabase()
     if client is None:
         return (True, 0, cap)
     try:
         r = client.rpc("increment_mcp_usage", {
             "p_user_id": user_id,
-            "p_month":   _current_month_utc(),
+            "p_month":   bucket,
             "p_cap":     cap,
         }).execute()
     except Exception as e:
@@ -410,18 +551,235 @@ def _err_sandbox_exhausted(count: int) -> ToolError:
 
 
 def _err_rate(tier: str, count: int, cap: int) -> ToolError:
+    win = window_for(tier)
     return _err({
         "error":        "rate_limit_exceeded",
-        "message":      (f"Monthly cap of {cap:,} tool calls reached on {tier} tier. "
-                         f"Upgrade at {PRICING_URL}"),
+        "message":      (f"Cap of {cap:,} tool calls per {win} reached on the {tier} "
+                         f"tier. The free tier resets at the top of each hour — "
+                         f"retry then, or upgrade at {PRICING_URL}"
+                         if win == "hour" else
+                         f"Cap of {cap:,} tool calls per {win} reached on the {tier} "
+                         f"tier. Upgrade at {PRICING_URL}"),
         "current_tier": tier,
+        "window":       win,
         "call_count":   count,
         "cap":          cap,
         "upgrade_url":  PRICING_URL,
     })
 
 
+def _err_payment_required(tool_name: str, entitlement: str = "metered_unpaid") -> ToolError:
+    """402 for a caller that may not call this tool, on either gated tier.
+
+    Every tool list here is DERIVED from the frozensets the gate actually
+    enforces. It used to be prose, and the prose was wrong: it told developers a
+    sandbox key covers "normalize, predict, and fleet health" when `predict` and
+    `fleet_health` are Pro-only — so the refusal that was supposed to unblock
+    someone walked them straight into a second 402. `free_tools` was wrong in the
+    other direction too: it always returned TRULY_FREE_TOOLS, understating a
+    sandbox key's surface by fifteen tools.
+
+    Both lists are now caller-accurate:
+      * `free_tools`    — what THIS key can call right now
+      * `sandbox_tools` — what a no-card forge_sandbox_ key covers
+
+    If a tool moves between FREE_TOOLS and ALL_TOOLS, this message follows it.
+    Nothing here is hand-maintained.
+    """
+    if entitlement == "free":
+        # A sandbox key that reached for a Pro tool. It is not "unpaid" — it has
+        # a real free surface; say what that surface is instead of implying none.
+        callable_now = sorted(FREE_TOOLS)
+        msg = (f"{tool_name} requires a paid plan. Your forge_sandbox_ key is free "
+               f"and covers {len(callable_now)} tools (listed in free_tools), "
+               f"{FREE_CAP} calls per hour across 3 machines. Add a payment method "
+               f"at {PRICING_URL} to enable {tool_name}.")
+    else:
+        # Metered (fnet_) key with no card: narrowed to the truly-free surface.
+        callable_now = sorted(TRULY_FREE_TOOLS)
+        msg = (f"{tool_name} is a paid tool and this metered (fnet_) key has no "
+               f"payment method on file. Add one at {PRICING_URL} to enable it, or "
+               f"evaluate with no card on a free forge_sandbox_ key, which covers "
+               f"{len(FREE_TOOLS)} tools including normalize_telemetry "
+               f"(listed in sandbox_tools) at {FREE_CAP} calls per hour.")
+    return _err({
+        "error":         "payment_method_required",
+        "message":       msg,
+        "tool":          tool_name,
+        "free_tools":    callable_now,
+        "sandbox_tools": sorted(FREE_TOOLS),
+        "upgrade_url":   PRICING_URL,
+    })
+
+
+# ── Per-tool cost ledger (forge_api_usage) ───────────────────────────────────
+# Canonical per-call USD price by MCP tool name. MUST stay in sync with
+# forge-prod/api.py TOOL_COSTS. Free tools are 0.00 but STILL logged so a
+# customer sees total call volume even on free tools. This ledger is VISIBILITY
+# ONLY (read by GET /v1/usage/summary); it NEVER charges — Stripe metering on
+# forge-prod (which honours the flat-plan exemption) is the sole charge path.
+# ALIGNED TO forge-prod/static/pricing.html, 2026-07-27. Must stay identical to
+# forge-prod/api.py TOOL_COSTS and to billing.METER_UNIT_CENTS/100.
+TOOL_COSTS: dict[str, float] = {
+    # ── Paid (must match the rate card to the cent) ──────────────────────────
+    # RECONCILED 2026-09-14 to forge-prod/api.py TOOL_COSTS and
+    # billing.METER_UNIT_CENTS/100. This table was still carrying the PRE-Model-B
+    # rate card: every paid entry disagreed with what the kernel actually meters
+    # (predict 0.05 vs 0.10, verify_record 0.05 vs 0.02, fleet_health 0.50 vs
+    # 0.20, machine_intelligence 1.00 vs 0.25, and normalize quoted as a flat
+    # 0.01 when it is graduated per 1,000 NTE). The MCP server was quoting stale
+    # prices to every agent that read them.
+    #
+    # normalize is GRADUATED per 1,000 NTE with no flat per-call price; the value
+    # here is the tier-1 retail rate for a single NTE ($0.30/1,000), matching
+    # forge-prod exactly.
+    "normalize_telemetry": 0.0003,
+    "predict": 0.10,
+    "predict_breach": 0.10,
+    "remaining_life": 0.10,
+    "verify_record": 0.02,
+    "health_index": 0.10,
+    "diagnose_machine": 0.10,
+    "fleet_health": 0.20,
+    "predict_batch": 0.20,
+    # ── Free (logged at 0.00 so call volume stays visible) ───────────────────
+    "detect_anomalies": 0.00,
+    "machine_intelligence": 0.00,
+    "identify_machine": 0.00,
+    "get_coverage": 0.00,
+    "correct_mapping": 0.00,
+    "calculate_oee": 0.00,
+    "fleet_oee": 0.00,
+    "energy_consumption": 0.00,
+    "shift_report": 0.00,
+    "get_agent_card": 0.00,
+    "list_agents": 0.00,
+    "list_guardrails": 0.00,
+    "check_guardrail": 0.00,
+    "prediction_accuracy": 0.00,
+    "create_automation": 0.00,
+    "activate_automation": 0.00,
+    "list_automations": 0.00,
+    "query_machine_history": 0.00,
+    "fire_sandbox": 0.00,
+    # In ALL_TOOLS and callable, but previously missing from this ledger — so
+    # their call volume never reached /v1/usage/summary. Free. Kept byte-identical
+    # to forge-prod/api.py TOOL_COSTS.
+    "delete_automation": 0.00,
+    "disable_automation": 0.00,
+    "restore_automation": 0.00,
+    "query_webhook_history": 0.00,
+}
+
+
+def _insert_usage_row(key_id: str, tool_name: str, cost: float) -> None:
+    """Synchronous single-row insert into forge_api_usage (runs off-thread).
+    Uses the service-key client, so RLS (service_role-only) is satisfied."""
+    client = _supabase()
+    if client is None:
+        return
+    try:
+        client.table("forge_api_usage").insert({
+            "api_key_id": key_id,
+            "tool_name":  tool_name,
+            "cost_usd":   round(float(cost or 0.0), 4),
+        }).execute()
+    except Exception as e:
+        logger.debug(f"gating: usage ledger insert skipped: {type(e).__name__}: {e}")
+
+
+async def log_usage(key_id: Optional[str], tool_name: str, cost: float) -> None:
+    """Fire-and-forget cost-ledger write for one tool call, keyed on the REAL
+    caller's key_id (from resolve_bearer). Non-blocking and fully fail-open —
+    supabase-py is sync so the insert runs in a worker thread; a ledger failure
+    must never surface to the tool caller. VISIBILITY ONLY — does not charge."""
+    if not key_id or not tool_name:
+        return
+    try:
+        await asyncio.to_thread(_insert_usage_row, key_id, tool_name, float(cost or 0.0))
+    except Exception as e:
+        logger.debug(f"gating: log_usage skipped: {type(e).__name__}: {e}")
+
+
 # ── The middleware itself ────────────────────────────────────────────────────
+
+# ── Payment-method gate (shared source of truth with forge-prod: Stripe) ─────
+# Mirrors forge-prod/api.py _customer_has_pm + _account_customer_id so a metered
+# fnet_ key is metered IDENTICALLY on MCP and REST. Both checks fail OPEN (treat
+# as entitled) on any error — a billing hiccup or an unset STRIPE_SECRET_KEY must
+# never break a live client; it only leaves the gate permissive until configured.
+
+_pm_cache: dict = {}
+_PM_TTL_S = 300
+_acct_cust_cache: dict = {}
+_ACCT_CUST_TTL_S = 300
+
+
+def _customer_has_pm(customer_id: Optional[str]) -> bool:
+    """Whether a Stripe customer has a usable card. Cached 5 min. Fail-OPEN."""
+    if not customer_id:
+        return False
+    now = time.time()
+    hit = _pm_cache.get(customer_id)
+    if hit and (now - hit[0]) < _PM_TTL_S:
+        return hit[1]
+    ok = True
+    try:
+        import stripe
+        stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+        cust = stripe.Customer.retrieve(customer_id)
+        inv = getattr(cust, "invoice_settings", None)
+        dm = getattr(inv, "default_payment_method", None) if inv else None
+        if dm:
+            ok = True
+        else:
+            pms = stripe.PaymentMethod.list(customer=customer_id, type="card", limit=1)
+            ok = bool(getattr(pms, "data", []))
+    except Exception as e:
+        logger.info(f"gating: PM check failed for {customer_id} ({type(e).__name__}) — fail-open")
+        ok = True
+    _pm_cache[customer_id] = (now, ok)
+    return ok
+
+
+def _account_customer_id(user_id: Optional[str]) -> Optional[str]:
+    """Stripe customer_id for an ACCOUNT (forge_users), cached 5 min. Lets an
+    forge_agent_ key — which inherits the parent plan but has no customer of its
+    own — resolve the owning account's billing. Fail-soft to None."""
+    if not user_id:
+        return None
+    now = time.time()
+    hit = _acct_cust_cache.get(user_id)
+    if hit and (now - hit[0]) < _ACCT_CUST_TTL_S:
+        return hit[1]
+    cust = None
+    client = _supabase()
+    if client is not None:
+        try:
+            row = (client.table("forge_users").select("stripe_customer_id")
+                   .eq("id", user_id).limit(1).execute().data or [{}])[0]
+            cust = row.get("stripe_customer_id")
+        except Exception as e:
+            logger.info(f"gating: account customer lookup failed for {user_id}: {type(e).__name__}")
+    _acct_cust_cache[user_id] = (now, cust)
+    return cust
+
+
+def _entitlement(info: dict) -> str:
+    """Collapse a caller's plan + card status into a gating decision:
+      'pro'            — metered WITH a card, or a flat paid plan → all tools
+      'metered_unpaid' — metered (fnet_) with NO card → only TRULY_FREE_TOOLS
+      'free'           — sandbox / legacy free_tier → FREE_TOOLS on the free cap
+    Keeps MCP metering identical to forge-prod's REST payment gate."""
+    plan = (info.get("plan") or "").strip().lower()
+    if plan == "metered":
+        cust = info.get("stripe_customer_id") or _account_customer_id(info.get("user_id"))
+        if cust and not _customer_has_pm(cust):
+            return "metered_unpaid"
+        return "pro"   # card on file, or customer unresolvable → fail-open
+    # sandbox → free; production/monitoring/runtime → pro; legacy → info['tier'].
+    return info.get("tier") or "free"
+
 
 class GatingMiddleware(Middleware):
     """fastmcp middleware: gates every tool call by tier + monthly cap.
@@ -456,15 +814,40 @@ class GatingMiddleware(Middleware):
         if info is None:
             raise _err_invalid_key()
 
-        tier = info["tier"]
+        # Resolve entitlement from plan + card status so a metered fnet_ key is
+        # metered on MCP exactly as on REST (Finding 3: no free ride via MCP).
+        ent = _entitlement(info)
+
         # Existence BEFORE paywall: a tool name we don't know is a typo / bad
         # call, not a paid feature. Telling a developer to "upgrade" for a tool
         # that doesn't exist is both wrong and infuriating.
         if tool_name not in ALL_TOOLS:
             raise _err_unknown_tool(tool_name)
-        allowed_tools = ALL_TOOLS if tier == "pro" else FREE_TOOLS
-        if tool_name not in allowed_tools:
-            raise _err_tier(tool_name, tier)
+
+        # Metered (fnet_) account with no card on file: only the truly-free
+        # tools work; every paid tool returns payment_required, identical to the
+        # REST 402. Free evaluation with no card is the forge_sandbox_ tier.
+        if ent == "metered_unpaid":
+            if tool_name not in TRULY_FREE_TOOLS:
+                raise _err_payment_required(tool_name, ent)
+            tier = "free"
+        else:
+            # SANDBOX (free tier) is restricted to FREE_TOOLS. This mirrors the
+            # REST 402 gate: a cardless sandbox key gets the free surface plus
+            # normalize (its trial allowance) and nothing else.
+            #
+            # This branch previously allowed a sandbox key to call ANY tool, on
+            # the stated assumption that "sandbox is not tool-restricted on REST".
+            # That assumption held until the REST paywall gate was added — after
+            # which MCP became a trivial bypass: the same sandbox key that gets
+            # 402 on POST /v1/machine_intelligence still got a full $0.25 answer
+            # by asking for it over MCP. Verified live before this fix.
+            #
+            # Paid accounts with no card were already narrowed to
+            # TRULY_FREE_TOOLS above; 'pro' keys are unrestricted.
+            if ent == "free" and tool_name not in FREE_TOOLS:
+                raise _err_payment_required(tool_name, ent)
+            tier = ent  # 'pro' (paid/flat, PRO_CAP) or 'free' (sandbox, FREE_CAP)
 
         # fire_sandbox runs against a separate lifetime counter (not the
         # monthly one) so a Free key can demo the full loop without burning
@@ -506,8 +889,38 @@ class GatingMiddleware(Middleware):
                     "mcp_user_id":    info["user_id"],
                     "mcp_call_count": count,
                     "mcp_cap":        cap,
+                    "mcp_key_id":     info.get("key_id"),
                 })
         except Exception:
             pass
 
-        return await call_next(context)
+        # Publish the caller's forge_api_keys ROW ID for the duration of this
+        # tool call so the upstream proxy (_headers() in mcp_server.py) can
+        # forward it as X-Forge-Caller-Key-Id and forge-prod can meter the real
+        # customer instead of this server's shared, billing_exempt proxy key.
+        #
+        # ContextVar — never a module global or an attribute on an object shared
+        # between requests: two tool calls in flight at once in this single
+        # process would otherwise overwrite each other's id and bill one
+        # customer for the other's usage. Each request runs in its own
+        # asyncio context, so a ContextVar set here is visible to everything
+        # awaited below it and to nothing else. Reset in `finally` so a reused
+        # context can never carry a stale id into an unauthenticated call.
+        _ck_token = _caller_key_id.set(str(info.get("key_id") or ""))
+        try:
+            result = await call_next(context)
+        finally:
+            _caller_key_id.reset(_ck_token)
+
+        # Per-tool cost ledger (visibility only; never charges). Logged AFTER a
+        # successful call, keyed on the REAL caller's key_id — fixes the
+        # shared-key attribution gap (upstream proxy calls run under the server's
+        # FOUNDRYNET_API_KEY). Free tools log at 0.00 so call volume is visible.
+        # Fire-and-forget: a ledger failure must never affect the tool response.
+        try:
+            asyncio.create_task(
+                log_usage(info.get("key_id"), tool_name, TOOL_COSTS.get(tool_name, 0.0)))
+        except Exception:
+            pass
+
+        return result
