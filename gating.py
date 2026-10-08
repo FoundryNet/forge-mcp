@@ -1,20 +1,28 @@
 """Per-client API gating for the FoundryNet MCP server.
 
-Until now every client of foundrynet-mcp-production shared one upstream
-FOUNDRYNET_API_KEY. This module flips that: each MCP client presents its
-own `Authorization: Bearer fnet_…` header on every tool call, we validate
-the key against Supabase, look up its tier, gate the requested tool
-against a tier→tools allowlist, and atomically check+increment a monthly
-usage counter against the per-tier cap.
+Each MCP client presents its own `Authorization: Bearer <Forge API key>` header
+on every tool call. We validate the key against Supabase, resolve its tier, gate
+the requested tool against a tier->tools ALLOWLIST, and atomically
+check+increment a monthly usage counter against the per-tier cap. One function,
+`enforce_call`, makes that whole decision, and both the MCP `tools/call` path and
+the A2A `POST /a2a/tasks` route go through it — they used to have separate rules,
+and the second route had none.
 
-Two tiers (Enterprise + attest_machine_action are deferred):
-  • Free  — 7 tools (normalize + read-only history/coverage + fire_sandbox demo
-            + corpus-feedback), 100 calls/month. Free keys are minted self-serve
-            via /v1/keys (no Stripe binding); `free_tier=true` in forge_api_keys.
-            Demo (chat-minted) keys also fall here.
-  • Pro   — all 29 deployed tools, 10 000 calls/month. Any active
-            forge_api_keys row without `free_tier=true` (i.e. paid keys
-            with a Stripe subscription) qualifies as Pro.
+Tiers (Enterprise + attest_machine_action are deferred):
+  • Free / sandbox   — the FREE_TOOLS set below, 100 calls/month. Minted
+                       self-serve; `plan='sandbox'`, or legacy `free_tier=true`.
+  • Metered, no card — narrowed further to TRULY_FREE_TOOLS, mirroring the REST
+                       402 for a cardless metered key.
+  • Pro              — all 32 tools, 10 000 calls/month.
+
+Tool COUNTS are deliberately not quoted here. They are asserted against
+forge-prod's own meter map by tests/test_rest_mcp_parity.py, because a count in
+a docstring is how this file and forge-prod came to describe two different free
+tiers to the same customer.
+
+The gate also binds the caller for the duration of the request (see
+CallerIdentity): the upstream call to forge-prod is made as the CALLER, not as
+this service, and refuses to run when the caller cannot be named.
 
 Errors are surfaced via `fastmcp.exceptions.ToolError`, which the MCP
 wire layer translates to `isError=true` with the error message as the
@@ -29,11 +37,13 @@ call but log) rather than 503'ing a paying customer's workflow.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -82,21 +92,34 @@ FREE_TOOLS: frozenset[str] = frozenset({
     "fleet_oee",               # whole-floor OEE — free per rate card
     "energy_consumption",      # energy + cost per machine — free per rate card
     "shift_report",            # shift handover summary — free per rate card
+    "detect_anomalies",        # statistical anomaly detection — no ML inference, and
+    #   forge-prod carries NO meter on POST /v1/anomaly and prices it 0.00, so it was
+    #   free over REST and Pro-only over MCP: the free tier meant two different things
+    #   depending on which door you knocked on. Measured in
+    #   tests/test_rest_mcp_parity.py (n = 36 tool/endpoint pairs).
 })
+# Prices in these comments are the metered truth from forge-prod TOOL_COSTS,
+# which is pinned by tests/test_rest_mcp_parity.py — not a second quote to drift.
 ALL_TOOLS: frozenset[str] = FREE_TOOLS | frozenset({
+    # Automation lifecycle. DECLARED DIVERGENCE: forge-prod carries no meter on
+    # PATCH/DELETE /v1/triggers/* and prices all three 0.00, so they are free over
+    # REST and Pro-only here. Left as-is deliberately — they MUTATE, and promoting
+    # a write into the free tier is a pricing decision, not a test fix. Filed as
+    # LANE_REQUESTS R-10. Pinned by the parity test so it cannot change silently.
     "disable_automation",
     "delete_automation",
     "restore_automation",
-    "verify_record",           # spec: settle_machine_work (Pro — $0.05/call)
-    "predict",                 # TimesFM forecast (Pro — runs ML inference, $0.05/call)
-    "predict_breach",          # parametric-insurance threshold-breach primitive (Pro — $0.05)
-    "remaining_life",          # remaining-useful-life estimate (Pro — $0.05/call)
-    "detect_anomalies",        # statistical anomaly detection (Pro — $0.02, no ML inference)
-    "health_index",            # composite multi-sensor health (Pro — $0.25/call)
-    "diagnose_machine",        # LLM root-cause analysis (Pro — $0.25/call)
-    "fleet_health",            # fleet health dashboard (Pro — $0.50/assessment)
-    "predict_batch",           # fleet-scale batch prediction (Pro — $0.50/call)
-    "machine_intelligence",    # full-stack machine analysis (Pro — $1.00/call)
+    "verify_record",           # spec: settle_machine_work (Pro — $0.02/call)
+    "predict",                 # TimesFM forecast (Pro — runs ML inference, $0.10/call)
+    "predict_breach",          # parametric-insurance threshold-breach primitive (Pro — $0.10)
+    "remaining_life",          # remaining-useful-life estimate (Pro — $0.10/call)
+    "health_index",            # composite multi-sensor health (Pro — $0.10/call)
+    "diagnose_machine",        # LLM root-cause analysis (Pro — $0.10/call)
+    "fleet_health",            # fleet health dashboard (Pro — $0.20/assessment)
+    "predict_batch",           # fleet-scale batch prediction (Pro — $0.20/call)
+    "machine_intelligence",    # full-stack machine analysis — chains TimesFM inference, so
+    #   Pro-only here; forge-prod gates it with _require_perm(PERM_PREDICT) + the
+    #   prediction rate limiter rather than with a meter, and prices it 0.00.
 })
 
 # Tools that are free on EVERY tier, including a metered account with no card on
@@ -390,14 +413,135 @@ def resolve_bearer(token: str) -> Optional[dict]:
     """Accept BOTH auth methods on a `Authorization: Bearer …` header:
     an OAuth JWT (checked first — verify signature) OR a raw Forge API key
     (fallback). Returns {user_id, tier, …} or None. This is the single entry
-    point the gating middleware uses so both paths gate identically."""
+    point the gating middleware uses so both paths gate identically.
+
+    `via` is always set — 'jwt' or 'key' — because the caller's upstream
+    identity depends on it: a raw key can be presented to forge-prod on the
+    caller's behalf, a JWT cannot (it carries key_id, not the key).
+    """
     token = (token or "").strip()
     if not token:
         return None
     via_jwt = _resolve_jwt(token)
     if via_jwt is not None:
         return via_jwt
-    return validate_key(token)
+    info = validate_key(token)
+    if info is not None:
+        info["via"] = "key"
+    return info
+
+
+# ── Caller identity, carried to the upstream hop ─────────────────────────────
+# forge-prod scopes every row it returns to the identity on the request. This
+# proxy used to put its own shared key on every upstream call and name no
+# caller, so every MCP tenant read and wrote inside ONE Forge account —
+# `fleet_oee`, `shift_report`, `list_agents` and `prediction_accuracy` take no
+# machine argument at all and returned that whole shared account, to any key,
+# including a free sandbox key. The tenant is now carried from the door to the
+# wire in a ContextVar, and the upstream hop REFUSES to run when it is absent:
+# a proxied call with no tenant is a call that would execute as everyone.
+
+@dataclass(frozen=True)
+class CallerIdentity:
+    """Who the tool call is FOR, resolved once at the door.
+
+    `upstream_key` is the caller's own Forge API key, present only when the
+    caller authenticated with one. It never appears in a log line, an error
+    payload or a ledger row — only in the Authorization header of the upstream
+    request it belongs to.
+    """
+    key_id: str
+    user_id: str
+    entitlement: str
+    via: str
+    upstream_key: Optional[str] = None
+
+    @property
+    def can_scope_upstream(self) -> bool:
+        return bool(self.upstream_key)
+
+
+_CALLER: contextvars.ContextVar[Optional[CallerIdentity]] = contextvars.ContextVar(
+    "forge_mcp_caller", default=None)
+
+
+def current_caller() -> Optional[CallerIdentity]:
+    return _CALLER.get()
+
+
+def bind_caller(info: dict, token: str) -> Any:
+    """Bind the resolved caller for the duration of this request.
+
+    Returns the ContextVar reset token. The raw bearer is kept ONLY when it is
+    a Forge API key: a JWT is not a credential forge-prod accepts, so storing
+    it would create an upstream identity that cannot actually be used.
+    """
+    via = (info.get("via") or "key").strip().lower()
+    return _CALLER.set(CallerIdentity(
+        key_id=info.get("key_id") or "",
+        user_id=info.get("user_id") or "",
+        entitlement=info.get("_entitlement") or info.get("tier") or "free",
+        via=via,
+        upstream_key=token if via == "key" else None,
+    ))
+
+
+def release_caller(reset_token: Any) -> None:
+    try:
+        _CALLER.reset(reset_token)
+    except Exception:
+        _CALLER.set(None)
+
+
+class TenantContextUnavailable(RuntimeError):
+    """Raised at the upstream hop when the caller cannot be named.
+
+    Deliberately not a soft fallback. The only fallback available is the
+    shared proxy key, and running a tenant's request under it is the exposure
+    this class exists to prevent. Missing context never becomes assumed
+    context.
+    """
+
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+    def as_tool_error(self) -> ToolError:
+        return _err({
+            "error":   "tenant_context_unavailable",
+            "message": self.detail,
+            "reason":  self.reason,
+        })
+
+
+def upstream_identity() -> tuple[str, str]:
+    """(bearer, caller_key_id) for the upstream call, or raise.
+
+    `caller_key_id` is forge-prod's `x-forge-caller-key-id`, which it already
+    reads in `_meter_attribution` — a forge_api_keys.id, not a secret, and
+    useless to anyone not already authenticated as the proxy.
+    """
+    caller = current_caller()
+    if caller is None:
+        raise TenantContextUnavailable(
+            "no_caller_bound",
+            "This request reached the upstream hop with no caller bound, so it "
+            "would have executed under the shared proxy identity. Refused.")
+    if not caller.key_id:
+        raise TenantContextUnavailable(
+            "caller_unidentified",
+            "The caller could not be named to forge-prod, so the call cannot be "
+            "scoped or attributed to a tenant. Refused.")
+    if not caller.can_scope_upstream:
+        raise TenantContextUnavailable(
+            "oauth_token_cannot_be_scoped",
+            "This call authenticated with an OAuth access token, which carries a "
+            "key id but not a Forge API key, so it cannot be presented to "
+            "forge-prod on your behalf. Re-authenticate with "
+            "`Authorization: Bearer <your Forge API key>` for tenant-scoped "
+            "tools.")
+    return caller.upstream_key, caller.key_id
 
 
 # ── Rate-limit counter (atomic RPC) ──────────────────────────────────────────
@@ -550,21 +694,27 @@ def _err_payment_required(tool_name: str, entitlement: str = "metered_unpaid") -
 # customer sees total call volume even on free tools. This ledger is VISIBILITY
 # ONLY (read by GET /v1/usage/summary); it NEVER charges — Stripe metering on
 # forge-prod (which honours the flat-plan exemption) is the sole charge path.
-# ALIGNED TO forge-prod/static/pricing.html, 2026-07-27. Must stay identical to
-# forge-prod/api.py TOOL_COSTS and to billing.METER_UNIT_CENTS/100.
+# ALIGNED TO forge-prod/api.py TOOL_COSTS, read out of its source and compared
+# entry-by-entry by tests/test_rest_mcp_parity.py — this is no longer a promise
+# in a comment. 13 of 34 entries had drifted when that test was first run
+# (2026-10-08): every paid tool. forge-prod was corrected to the metered truth on
+# 2026-09-04 and this copy was not, so the usage summary quoted MCP callers
+# prices from 2.5x too high (machine_intelligence $1.00 against a metered $0.00)
+# to half the real figure (predict $0.05 against $0.10). forge-prod wins, because
+# it is the side that actually fires the Stripe meter.
 TOOL_COSTS: dict[str, float] = {
     # ── Paid (must match the rate card to the cent) ──────────────────────────
-    "normalize_telemetry": 0.01,
-    "predict": 0.05,
-    "predict_breach": 0.05,
-    "remaining_life": 0.05,
-    "verify_record": 0.05,
-    "detect_anomalies": 0.02,
-    "health_index": 0.25,
-    "diagnose_machine": 0.25,
-    "fleet_health": 0.50,
-    "predict_batch": 0.50,
-    "machine_intelligence": 1.00,
+    "normalize_telemetry": 0.0003,
+    "predict": 0.10,
+    "predict_breach": 0.10,
+    "remaining_life": 0.10,
+    "verify_record": 0.02,
+    "detect_anomalies": 0.00,
+    "health_index": 0.10,
+    "diagnose_machine": 0.10,
+    "fleet_health": 0.20,
+    "predict_batch": 0.20,
+    "machine_intelligence": 0.00,
     # ── Free (logged at 0.00 so call volume stays visible) ───────────────────
     "identify_machine": 0.00,
     "get_coverage": 0.00,
@@ -702,6 +852,132 @@ def _entitlement(info: dict) -> str:
     return info.get("tier") or "free"
 
 
+# ── cacheScope: private ──────────────────────────────────────────────────────
+# Every tool result here is tenant-scoped: it is derived from ONE caller's
+# machines under ONE caller's key. Nothing in it may be served to a second
+# caller by anything in the path — and the path has caches in it. Smithery
+# proxies user traffic through its own hosted gateway, and mcp.foundrynet.io is
+# Cloudflare-fronted.
+#
+# The MCP 2026-07-28 spec gives this a name, `cacheScope`, as a first-class
+# field on a tool result. MEASURED on the pinned line (fastmcp 3.4.8, mcp SDK
+# `LATEST_PROTOCOL_VERSION = "2025-11-25"`, 2026-10-08): neither library knows
+# the string `cacheScope` anywhere, and the 2026-07-28 revision is not
+# implemented at all. The native field is therefore NOT achievable under
+# `fastmcp<4`, and the pin exists because 4.x is a beta that drops the 3.x
+# compat shims this server's tool surface is built on. That gap is declared, not
+# papered over: see tests/test_cache_scope.py, which asserts the gap still
+# exists so that closing it is a deliberate act.
+#
+# What IS achievable, and is done, has two parts:
+#   1. `_meta.cacheScope = "private"` on every tool result. `_meta` is the
+#      protocol's sanctioned extension point and round-trips today, so a
+#      2026-07-28-aware intermediary reads the declaration even though the
+#      library cannot type it.
+#   2. `Cache-Control: no-store, private` on the HTTP response (see
+#      mcp_server.build_dual_app). This is the half with teeth: the transport
+#      default measured on this build was `no-cache, no-transform`, which
+#      PERMITS an intermediary to store the response and merely requires
+#      revalidation. For a tenant-scoped body, storage is the problem.
+CACHE_SCOPE_PRIVATE = "private"
+
+
+def _mark_private(result: Any) -> Any:
+    """Attach the private cache scope to a tool result, in place, fail-soft.
+
+    A result shape that cannot carry `_meta` is returned untouched rather than
+    raising: the HTTP header in part 2 still covers it, and a failed annotation
+    must never turn a successful tool call into an error.
+    """
+    try:
+        meta = getattr(result, "meta", None)
+        if meta is None:
+            result.meta = {"cacheScope": CACHE_SCOPE_PRIVATE}
+        elif isinstance(meta, dict):
+            meta.setdefault("cacheScope", CACHE_SCOPE_PRIVATE)
+    except Exception:
+        pass
+    return result
+
+
+def enforce_call(tool_name: str, info: dict) -> tuple[str, int, int]:
+    """THE gate. Existence, entitlement, then the counter. Returns
+    (tier, call_count, cap); raises ToolError on any refusal.
+
+    Extracted from the middleware so the MCP `tools/call` path and the A2A
+    `POST /a2a/tasks` path enforce the SAME rules. They did not: A2A
+    authenticated the caller and then dispatched straight to the kernel with no
+    tier check, no cap and no payment gate, so a free sandbox key could run
+    `fleet_intelligence` (/v1/fleet_health) and `diagnose` through it without
+    limit — the exact bypass the tools/call branch below was written to close,
+    reopened on a second route. Two gates is one gate too many.
+    """
+    ent = _entitlement(info)
+    info["_entitlement"] = ent
+
+    # Existence BEFORE paywall: a tool name we don't know is a typo / bad call,
+    # not a paid feature. Telling a developer to "upgrade" for a tool that does
+    # not exist is both wrong and infuriating.
+    if tool_name not in ALL_TOOLS:
+        raise _err_unknown_tool(tool_name)
+
+    if ent == "metered_unpaid":
+        # Metered (fnet_) account with no card on file: only the truly-free
+        # tools work; every paid tool returns payment_required, identical to the
+        # REST 402. Free evaluation with no card is the forge_sandbox_ tier.
+        if tool_name not in TRULY_FREE_TOOLS:
+            raise _err_payment_required(tool_name, ent)
+        tier = "free"
+    else:
+        # SANDBOX (free tier) is restricted to FREE_TOOLS. This mirrors the REST
+        # 402 gate: a cardless sandbox key gets the free surface plus normalize
+        # (its trial allowance) and nothing else.
+        #
+        # This branch previously allowed a sandbox key to call ANY tool, on the
+        # stated assumption that "sandbox is not tool-restricted on REST". That
+        # assumption held until the REST paywall gate was added — after which
+        # MCP became a trivial bypass: the same sandbox key that gets 402 on
+        # POST /v1/machine_intelligence still got a full $1.00 answer by asking
+        # for it over MCP. Verified live before this fix.
+        #
+        # Paid accounts with no card were already narrowed to TRULY_FREE_TOOLS
+        # above; 'pro' keys are unrestricted.
+        if ent == "free" and tool_name not in FREE_TOOLS:
+            raise _err_payment_required(tool_name, ent)
+        tier = ent  # 'pro' (paid/flat, PRO_CAP) or 'free' (sandbox, FREE_CAP)
+
+    # fire_sandbox runs against a separate lifetime counter (not the monthly
+    # one) so a Free key can demo the full loop without burning its month's
+    # allowance, and so the sandbox endpoint can't be held open by a single key
+    # forever.
+    count, cap = 0, (PRO_CAP if tier == "pro" else FREE_CAP)
+    if tool_name == "fire_sandbox":
+        client = _supabase()
+        if client is not None:
+            try:
+                r = client.rpc("increment_mcp_usage", {
+                    "p_user_id": info["user_id"],
+                    "p_month":   SANDBOX_MONTH_KEY,
+                    "p_cap":     SANDBOX_FIRE_CAP,
+                }).execute()
+                rows = r.data or []
+                if rows:
+                    row = rows[0]
+                    if not bool(row.get("allowed")):
+                        raise _err_sandbox_exhausted(int(row.get("call_count") or 0))
+                    count, cap = int(row.get("call_count") or 0), SANDBOX_FIRE_CAP
+            except ToolError:
+                raise
+            except Exception as e:
+                logger.warning(f"gating: sandbox counter failed: {type(e).__name__}: {e}")
+                # Fail OPEN — same posture as the monthly counter.
+    else:
+        ok, count, cap = check_and_increment(info["user_id"], tier)
+        if not ok:
+            raise _err_rate(tier, count, cap)
+    return tier, count, cap
+
+
 class GatingMiddleware(Middleware):
     """fastmcp middleware: gates every tool call by tier + monthly cap.
 
@@ -730,97 +1006,46 @@ class GatingMiddleware(Middleware):
 
         # Accept a raw Forge API key OR an OAuth client-credentials JWT. JWT is
         # verified first, then we fall back to direct key lookup — existing
-        # `Bearer forge_prod_…` clients are unaffected.
+        # `Bearer forge_prod_...` clients are unaffected.
         info = resolve_bearer(token)
         if info is None:
             raise _err_invalid_key()
 
-        # Resolve entitlement from plan + card status so a metered fnet_ key is
-        # metered on MCP exactly as on REST (Finding 3: no free ride via MCP).
-        ent = _entitlement(info)
+        # One gate, shared with the A2A route (see enforce_call).
+        tier, count, cap = enforce_call(tool_name, info)
 
-        # Existence BEFORE paywall: a tool name we don't know is a typo / bad
-        # call, not a paid feature. Telling a developer to "upgrade" for a tool
-        # that doesn't exist is both wrong and infuriating.
-        if tool_name not in ALL_TOOLS:
-            raise _err_unknown_tool(tool_name)
-
-        # Metered (fnet_) account with no card on file: only the truly-free
-        # tools work; every paid tool returns payment_required, identical to the
-        # REST 402. Free evaluation with no card is the forge_sandbox_ tier.
-        if ent == "metered_unpaid":
-            if tool_name not in TRULY_FREE_TOOLS:
-                raise _err_payment_required(tool_name, ent)
-            tier = "free"
-        else:
-            # SANDBOX (free tier) is restricted to FREE_TOOLS. This mirrors the
-            # REST 402 gate: a cardless sandbox key gets the free surface plus
-            # normalize (its trial allowance) and nothing else.
-            #
-            # This branch previously allowed a sandbox key to call ANY tool, on
-            # the stated assumption that "sandbox is not tool-restricted on REST".
-            # That assumption held until the REST paywall gate was added — after
-            # which MCP became a trivial bypass: the same sandbox key that gets
-            # 402 on POST /v1/machine_intelligence still got a full $1.00 answer
-            # by asking for it over MCP. Verified live before this fix.
-            #
-            # Paid accounts with no card were already narrowed to
-            # TRULY_FREE_TOOLS above; 'pro' keys are unrestricted.
-            if ent == "free" and tool_name not in FREE_TOOLS:
-                raise _err_payment_required(tool_name, ent)
-            tier = ent  # 'pro' (paid/flat, PRO_CAP) or 'free' (sandbox, FREE_CAP)
-
-        # fire_sandbox runs against a separate lifetime counter (not the
-        # monthly one) so a Free key can demo the full loop without burning
-        # its month's allowance, and so the sandbox endpoint can't be
-        # held open by a single key forever.
-        if tool_name == "fire_sandbox":
-            client = _supabase()
-            if client is not None:
-                try:
-                    r = client.rpc("increment_mcp_usage", {
-                        "p_user_id": info["user_id"],
-                        "p_month":   SANDBOX_MONTH_KEY,
-                        "p_cap":     SANDBOX_FIRE_CAP,
-                    }).execute()
-                    rows = r.data or []
-                    if rows:
-                        row = rows[0]
-                        if not bool(row.get("allowed")):
-                            raise _err_sandbox_exhausted(int(row.get("call_count") or 0))
-                except ToolError:
-                    raise
-                except Exception as e:
-                    logger.warning(f"gating: sandbox counter failed: {type(e).__name__}: {e}")
-                    # Fail OPEN — same posture as the monthly counter.
-        else:
-            ok, count, cap = check_and_increment(info["user_id"], tier)
-            if not ok:
-                raise _err_rate(tier, count, cap)
-
-        # Stash tier so tools could surface it via meta if useful later.
+        # Carry the tenant from the door to the wire. Without this the upstream
+        # hop has no caller and refuses, rather than running as everyone.
+        reset = bind_caller(info, token)
         try:
-            ctx = getattr(context, "fastmcp_context", None)
-            if ctx is not None:
-                # Best-effort: keep the key off the request for any downstream
-                # tool that wants to log the caller without re-validating.
-                ctx.state = getattr(ctx, "state", {}) or {}
-                ctx.state.update({
-                    "mcp_tier":       tier,
-                    "mcp_user_id":    info["user_id"],
-                    "mcp_call_count": count,
-                    "mcp_cap":        cap,
-                })
-        except Exception:
-            pass
+            # Stash tier so tools could surface it via meta if useful later.
+            try:
+                ctx = getattr(context, "fastmcp_context", None)
+                if ctx is not None:
+                    # Best-effort: keep the key off the request for any downstream
+                    # tool that wants to log the caller without re-validating.
+                    ctx.state = getattr(ctx, "state", {}) or {}
+                    ctx.state.update({
+                        "mcp_tier":       tier,
+                        "mcp_user_id":    info["user_id"],
+                        "mcp_call_count": count,
+                        "mcp_cap":        cap,
+                    })
+            except Exception:
+                pass
 
-        result = await call_next(context)
+            try:
+                result = await call_next(context)
+            except TenantContextUnavailable as e:
+                raise e.as_tool_error() from None
+            result = _mark_private(result)
+        finally:
+            release_caller(reset)
 
         # Per-tool cost ledger (visibility only; never charges). Logged AFTER a
-        # successful call, keyed on the REAL caller's key_id — fixes the
-        # shared-key attribution gap (upstream proxy calls run under the server's
-        # FOUNDRYNET_API_KEY). Free tools log at 0.00 so call volume is visible.
-        # Fire-and-forget: a ledger failure must never affect the tool response.
+        # successful call, keyed on the REAL caller's key_id. Free tools log at
+        # 0.00 so call volume is visible. Fire-and-forget: a ledger failure must
+        # never affect the tool response.
         try:
             asyncio.create_task(
                 log_usage(info.get("key_id"), tool_name, TOOL_COSTS.get(tool_name, 0.0)))

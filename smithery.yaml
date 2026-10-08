@@ -5,7 +5,8 @@ name: "@foundrynet/forge"
 displayName: "Forge by Foundry Labs — Industrial Machine Intelligence"
 description: >-
   Natural language to machine action. Cross-manufacturer industrial telemetry
-  normalization across 18 OEM families with thousands of confirmed field mappings.
+  normalization across 45 vendor packs in 19 verticals, from a corpus of 16,908
+  confirmed field mappings (MIT-public at github.com/FoundryNet/canonical-schema).
   32 MCP tools for machine identity, normalization, history, plain-English
   automation, TimesFM prediction (forecast, threshold-breach, remaining-life,
   batch + fleet health, anomaly detection, full-stack machine intelligence),

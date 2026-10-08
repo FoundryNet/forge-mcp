@@ -1,8 +1,8 @@
 # Forge by Foundry Labs — Industrial Machine Intelligence
 
 The cross-manufacturer industrial MCP server. Talk to any CNC, robot, or industrial
-machine in natural language — machine identity, telemetry normalization across 18 OEM
-families, plain-English automation, and tamper-evident work records.
+machine in natural language — machine identity, telemetry normalization across 45
+vendor packs in 19 verticals, plain-English automation, and tamper-evident work records.
 
 Hosted MCP over Streamable HTTP. 32 tools wrap the Forge v1 API: provision a stable machine
 identity, normalize raw OEM telemetry into a canonical schema, query operational history,
@@ -26,19 +26,53 @@ activate), and records every state-changing action as a tamper-evident work reco
 
 ## Architecture
 
-Pure HTTP proxy. Every tool is a thin wrapper around `https://forge.foundrynet.io/v1/*`
-using a configured `fnet_` Bearer key. No state, no shared imports with `forge-prod` —
-separate Railway service, separate dependencies (`fastmcp` + `httpx`).
+Pure HTTP proxy. Every tool is a thin wrapper around `https://forge.foundrynet.io/v1/*`.
+No state, no shared imports with `forge-prod` — separate Railway service, separate
+dependencies (`fastmcp` + `httpx`).
 
 ```
 Claude Desktop / agent
         │ Streamable HTTP (/mcp) — or legacy SSE (/sse)
+        │ Authorization: Bearer <the CALLER's Forge API key>
         ▼
   foundrynet-mcp on Railway
-        │ HTTPS + Bearer fnet_…
+        │ gate: validate key → tier → cap → bind caller
+        │ HTTPS, Authorization: Bearer <the SAME caller's key>
+        │        X-Forge-Caller-Key-Id: <their forge_api_keys.id>
         ▼
-  forge.foundrynet.io/v1/*
+  forge.foundrynet.io/v1/*  — scopes every row to that caller
 ```
+
+**Tenancy.** The upstream call is made as the CALLER, not as this server. It used
+to be made with the server's own `FOUNDRYNET_API_KEY` for every caller, with no
+caller named: forge-prod scopes rows to the authenticated key's owner, so every
+MCP tenant read and wrote inside one shared Forge account — and `fleet_oee`,
+`shift_report`, `list_agents` and `prediction_accuracy` take no machine argument,
+so they returned that whole account. The upstream hop now REFUSES to run when it
+cannot name the caller: there is no fallback, because the only fallback is the
+shared key. OAuth access tokens carry a key id but not a key, so they cannot be
+presented upstream and are refused on tool calls with
+`tenant_context_unavailable`.
+
+`POST /a2a/tasks` and `GET /a2a/agents` go through the same gate function
+(`gating.enforce_call`) as `tools/call`, by skill→tool mapping. They previously
+authenticated the caller and then dispatched with no tier check, no cap and no
+payment gate, which made the A2A route a free pass to the paid inference tools.
+
+## Tests and the release gate
+
+```
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest pytest-asyncio
+.venv/bin/python -m pytest tests/ -q        # 99 checks
+scripts/release_gate.sh                     # tree, deps, import, suite, version
+```
+
+The suite drives the real ASGI app over real Streamable HTTP through the real
+gate; only Supabase and the upstream hop are substituted, and the upstream
+substitute RECORDS requests, because what identity this server presents to
+forge-prod is the thing most worth asserting. `tests/test_rest_mcp_parity.py`
+measures free-tier parity against forge-prod's own `_endpoint_to_billing_meter`,
+read out of its source at test time rather than copied.
 
 ## Tools (32)
 
@@ -96,10 +130,12 @@ Get a free `fnet_` key at https://foundrynet.io/signup?utm_source=github&utm_med
 
 | Var | Required | Default |
 |---|---|---|
-| `FOUNDRYNET_API_KEY` | Yes | — (server boots; tool calls return 401 until set) |
+| `FOUNDRYNET_API_KEY` | No longer used on the tool path | Kept for the boot-time config report only; tool calls run as the caller's own key |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` | Yes for gating | unset = gating disabled, fail-open |
+| `MCP_JWT_SECRET` | No | unset = OAuth token issuance disabled (503), key auth unaffected |
 | `FORGE_BASE_URL` | No | `https://forge.foundrynet.io` |
 | `PORT` | No | 8080 (Railway sets this automatically) |
-| `REQUEST_TIMEOUT` | No | 30 (seconds) |
+| `REQUEST_TIMEOUT` | No | 120 (seconds) |
 
 ## Files
 
@@ -107,9 +143,11 @@ Get a free `fnet_` key at https://foundrynet.io/signup?utm_source=github&utm_med
 - `gating.py` — per-client tier gating (Free vs Pro tool/quota enforcement)
 - `server.json` — MCP registry metadata (name, description, keywords, remote endpoint)
 - `smithery.yaml` — Smithery listing metadata
-- `requirements.txt` — `fastmcp>=2.0`, `httpx>=0.27`
+- `requirements.txt` — `fastmcp>=3.4.5,<4`, `httpx>=0.27`, `PyJWT>=2.14.0`, `supabase`, `stripe`
+- `tests/` — the behavioural suite (auth, tenancy, parity, idempotency, cache scope)
+- `scripts/release_gate.sh` — must be green on the exact commit before a deploy
 - `Procfile` — Railway start command (`web: python mcp_server.py`)
 
 ## License
 
-Proprietary (commercial). © Foundry Labs LLC. Contact: forge@foundrynet.io
+Proprietary (commercial). © Foundry Labs LLC. Contact: foundrynet@proton.me
