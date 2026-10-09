@@ -4,5 +4,9 @@
 fastmcp>=3.4.5,<4
 httpx>=0.27
 supabase>=2.7
-PyJWT>=2.8
+# PyJWT: >=2.14.0. The OAuth client-credentials path signs and verifies HS256
+# access tokens, and the >=2.8 floor let an install resolve to a release line
+# whose `options={"require": [...]}` handling predates the behaviour
+# _resolve_jwt depends on. The release gate asserts the installed version.
+PyJWT>=2.14.0
 stripe>=11.0

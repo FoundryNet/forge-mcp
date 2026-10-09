@@ -9,16 +9,21 @@ Protocol so any compatible agent (Claude Desktop, Cursor, etc.) can:
   - set up natural-language automations against canonical fields
   - record verifiable, tamper-evident records of completed work
 
-Per-call gating (see gating.py): every tools/call must carry
-`Authorization: Bearer fnet_…` on the wire. The middleware validates the
-key against Supabase, looks up the tier (free → 12 read-only + demo tools,
-100 calls/mo; pro → all 32 tools, 10000 calls/mo), and atomically increments
-a monthly counter. Tier or rate-limit violations surface as structured
-JSON ToolError payloads with `upgrade_url: forge.foundrynet.io/pricing`.
+Per-call gating (see gating.py): every tools/call must carry a
+`Authorization: Bearer <Forge API key>` header on the wire. The middleware
+validates the key against Supabase, resolves the tier (free/sandbox -> the 20
+free tools, 100 calls/mo; pro -> all 32, 10 000 calls/mo), and atomically
+increments a monthly counter. Tier, cap and payment violations surface as
+structured JSON ToolError payloads with
+`upgrade_url: forge.foundrynet.io/pricing`.
 
-Upstream calls from each tool still use the shared FOUNDRYNET_API_KEY
-configured on this service (Bearer fnet_… key created via /v1/keys on
-the Forge service); per-user pass-through is a future deliverable.
+Upstream calls are made AS THE CALLER: the caller's own key goes on the
+Authorization header and their `forge_api_keys.id` on X-Forge-Caller-Key-Id, so
+forge-prod scopes every row to the real tenant and meters the real customer.
+They used to be made with this service's shared FOUNDRYNET_API_KEY, which put
+every MCP tenant inside one Forge account. `_headers()` carries the full story
+and the measurement; the upstream hop refuses to run when the caller cannot be
+named, with no fallback, because the only fallback is the shared key.
 
 Transport: dual. Streamable HTTP at /mcp (modern clients + Smithery's hosted
 gateway, which 405s on legacy SSE) AND legacy SSE at /sse (+ /messages) so
@@ -27,9 +32,11 @@ existing mcp-remote configs published since May keep working. New users get /mcp
 Health check: GET /health (returns config presence without leaking the key).
 
 Required env:
-  FOUNDRYNET_API_KEY    fnet_… key for the Forge user this server represents.
+  SUPABASE_URL / SUPABASE_SERVICE_KEY   gating lookups (unset = gating disabled).
 
 Optional env:
+  FOUNDRYNET_API_KEY    No longer used on the tool path — reported by /health only.
+  MCP_JWT_SECRET        Unset = OAuth token issuance disabled; key auth unaffected.
   FORGE_BASE_URL        Default https://forge.foundrynet.io
   PORT                  Default 8080 (Railway sets this automatically)
   REQUEST_TIMEOUT       HTTP read timeout in seconds, default 120 (TimesFM inference is slow)
@@ -67,8 +74,9 @@ PORT               = int(os.environ.get("PORT", "8080"))
 
 if not FOUNDRYNET_API_KEY:
     logger.warning(
-        "FOUNDRYNET_API_KEY is not set — every tool call will return a 401. "
-        "Set it via the Railway dashboard before traffic hits this server."
+        "FOUNDRYNET_API_KEY is not set. This no longer affects tool calls — "
+        "each one authenticates upstream as its own caller — so the server is "
+        "fully functional without it. Kept only for the /health config report."
     )
 
 # version= is required: without it FastMCP reports its OWN library version as
@@ -80,9 +88,11 @@ mcp = FastMCP("foundrynet", version="3.4.4")
 # correct_mapping + get_coverage, 100/mo); Pro keys see all 14 (10 000/mo).
 # Errors are ToolError-wrapped structured JSON payloads carrying
 # upgrade_url/signup_url. See gating.py.
+import gating  # noqa: E402
 from gating import (  # noqa: E402 — needs mcp instantiated first
     GatingMiddleware, issue_access_token, oauth_enabled,
     OAUTH_ISSUER, JWT_TTL_SECONDS, FREE_TOOLS, resolve_bearer,
+    TenantContextUnavailable, bind_caller, release_caller, enforce_call,
 )
 mcp.add_middleware(GatingMiddleware())
 
@@ -90,14 +100,46 @@ mcp.add_middleware(GatingMiddleware())
 # ── HTTP plumbing ────────────────────────────────────────────────────────────
 
 def _headers() -> dict:
+    """Headers for ONE upstream call, carrying the identity of the caller it is
+    being made for.
+
+    This used to put `FOUNDRYNET_API_KEY` — this server's own key — on every
+    upstream request, for every caller, and name no caller at all. forge-prod
+    scopes every row it returns to the authenticated key's `user_id`, so every
+    MCP tenant read and wrote inside ONE Forge account. `fleet_oee`,
+    `shift_report`, `list_agents` and `prediction_accuracy` take no machine
+    argument, so they returned that whole shared account to whoever asked,
+    including a free sandbox key; `query_machine_history`, `calculate_oee`,
+    `energy_consumption`, `list_guardrails` and `list_automations` returned any
+    `machine_id` in it, caller-supplied. Measured in
+    tests/test_tenancy_isolation.py before the fix: both tenants reached
+    forge-prod as the same bearer with `caller_key_id=None`.
+
+    Two things now ride on every request:
+      * Authorization — the CALLER's own Forge API key, so forge-prod scopes
+        rows to the real tenant and applies its own entitlement gate as a
+        second, independent check.
+      * X-Forge-Caller-Key-Id — the caller's `forge_api_keys.id`. forge-prod
+        already reads this header (`api.py` `_meter_attribution`); nothing was
+        ever sending it, so attribution returned
+        `(None, "mcp_caller_unidentified")` and no Stripe meter event fired for
+        any metered MCP call.
+
+    `X-Forge-Origin: mcp` stays, as a true statement that this hop is a proxy.
+    forge-prod only honours it for a key whose `metadata.trusted_origin`
+    matches, so a customer key claiming it changes nothing there — which is
+    what we want: the call is metered as the direct call it now effectively is.
+
+    Raises `TenantContextUnavailable` when the caller cannot be named. There is
+    no fallback, because the only fallback is the shared key.
+    """
+    bearer, caller_key_id = gating.upstream_identity()
     return {
-        "Authorization": f"Bearer {FOUNDRYNET_API_KEY}",
+        "Authorization": f"Bearer {bearer}",
         "Content-Type":  "application/json",
         "User-Agent":    "FoundryNet-MCP/1.0",
-        # Tells forge-prod this call is an MCP proxy under the shared server key,
-        # so its cost ledger skips it — the gating middleware here logs the call
-        # under the REAL caller's key instead (no mis-attribution / double-count).
         "X-Forge-Origin": "mcp",
+        "X-Forge-Caller-Key-Id": caller_key_id,
     }
 
 
@@ -113,6 +155,98 @@ def _shape_error(status: int, body_text: str) -> dict:
 
 RETRY_DELAY_SECONDS = 2
 RETRYABLE_EXCEPTIONS = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError)
+
+# Which methods may be retried after WHICH failure, and why the distinction is
+# not cosmetic.
+#
+# The retry used to fire on ConnectError, ReadTimeout and RemoteProtocolError
+# for every method. Those three failures are not equivalent:
+#
+#   ConnectError         — the TCP/TLS connection never came up, so the request
+#                          was never delivered. Retrying is safe for anything.
+#   ReadTimeout          — the request WAS delivered; only the response was
+#                          lost. The kernel may already have applied it.
+#   RemoteProtocolError  — ambiguous, and ambiguity resolves the same way.
+#
+# So a `POST /v1/settle` or `POST /v1/normalize` that read-timed-out was retried
+# blindly, and a kernel that had already succeeded applied it twice: two work
+# records for one action, two normalize calls on the caller's meter — and the
+# meter is now the CALLER's, because this proxy presents their key upstream. A
+# duplicated write and a double charge from a dropped response packet.
+#
+# Safe methods (no side effect by definition, RFC 9110 §9.2.1) keep the full
+# retry. Everything else retries only when we can prove the request never
+# arrived. There is no idempotency key on the kernel API to lean on instead;
+# when there is one, this rule can be relaxed deliberately rather than by
+# default.
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_NEVER_DELIVERED = (httpx.ConnectError,)
+
+# POST paths that are DECLARED to have no effect the kernel keeps.
+#
+# Method alone was too blunt. Most of Forge's valuable calls are POSTs that
+# compute and return — the whole TimesFM set, the anomaly and intelligence
+# chains, the guardrail DRY RUN, and /v1/identify, whose own tool docstring says
+# "Idempotent." Those are also the SLOWEST calls on the service (REQUEST_TIMEOUT
+# defaults to 120s precisely for them), so ReadTimeout is their most likely
+# failure, and withholding the retry traded a duplicate-write risk on four
+# endpoints for a new failure mode on ten that were safe.
+#
+# This is an ALLOWLIST and it is the list that grows; the unsafe set
+# (/v1/settle, /v1/verify_record, /v1/normalize, /v1/triggers/*) is the small
+# stable one. A path not named here is not retried after delivery, so adding a
+# mutating endpoint later inherits the safe behaviour by default.
+#
+# `/v1/predict_breach` is conditional: with `settle=true` it SETTLES, which is a
+# write, so the body decides. A caller-supplied flag narrowing the check is the
+# only direction allowed here — it can withhold a retry, never grant one.
+_SAFE_POST_PATHS = frozenset({
+    "/v1/predict",
+    "/v1/predict_batch",
+    "/v1/remaining_life",
+    "/v1/fleet_health",
+    "/v1/anomaly",
+    "/v1/machine_intelligence",
+    "/v1/guardrails/check",
+    "/v1/identify",
+})
+_SAFE_POST_PREFIXES = ("/v1/diagnose/",)
+# Safe only when the request does not ask for a side effect, keyed on the field
+# that causes one.
+_CONDITIONALLY_SAFE_POSTS = {"/v1/predict_breach": "settle"}
+
+
+def _post_has_no_effect(path: str, body: Optional[dict]) -> bool:
+    p = "/" + (path or "").strip("/")
+    if p in _SAFE_POST_PATHS:
+        return True
+    if any(p.startswith(x) for x in _SAFE_POST_PREFIXES):
+        return True
+    flag = _CONDITIONALLY_SAFE_POSTS.get(p)
+    if flag is not None:
+        # Absent or falsey means no side effect. Anything else, including a
+        # value we cannot read, resolves to "it might settle".
+        return not bool((body or {}).get(flag))
+    return False
+
+
+def _may_retry(method: str, exc: BaseException, path: str = "",
+               body: Optional[dict] = None) -> bool:
+    """Whether this exact request may be sent a second time.
+
+    Three inputs, in the order they settle the question:
+      * the method, because a safe method has no effect to duplicate;
+      * the exception, because a ConnectError proves nothing was delivered;
+      * the path and body, because a POST that only computes has nothing to
+        duplicate either — but only when it is declared so.
+    """
+    if (method or "").upper() in _IDEMPOTENT_METHODS:
+        return True
+    if isinstance(exc, _NEVER_DELIVERED):
+        return True
+    if (method or "").upper() == "POST" and _post_has_no_effect(path, body):
+        return True
+    return False
 
 
 async def _call_forge_raw(method: str, path: str, *,
@@ -143,10 +277,20 @@ async def _call_forge_raw(method: str, path: str, *,
                                          params=params)
         except RETRYABLE_EXCEPTIONS as e:
             last_exc = e
-            if attempt == 0:
+            if attempt == 0 and _may_retry(method, e, path, body):
                 logger.info(f"_call_forge_raw transient {type(e).__name__} on {method} {path}, retrying in {RETRY_DELAY_SECONDS}s")
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
+            if attempt == 0:
+                # Not retried ON PURPOSE: the request may already have been
+                # applied, and re-sending a write is worse than reporting the
+                # failure. Say so, so the caller can decide.
+                logger.info(f"_call_forge_raw {type(e).__name__} on {method} {path} "
+                            f"— not retried (non-idempotent method, delivery unknown)")
+                return {"error": "network",
+                        "detail": f"{type(e).__name__}: {e}",
+                        "attempts": 1,
+                        "retry_withheld": "non_idempotent_method_delivery_unknown"}
             return {"error": "network",
                     "detail": f"{type(e).__name__}: {e}",
                     "attempts": 2}
@@ -1256,9 +1400,13 @@ async def health(request: Request) -> JSONResponse:
         # Registry-derived; the single source of truth other surfaces read from.
         "tools_count":        len(await mcp.list_tools()),
         "forge_base_url":     FORGE_BASE_URL,
-        "key_configured":     bool(FOUNDRYNET_API_KEY),
+        # Reported, not required: tool calls authenticate upstream as the
+        # caller, so this says nothing about whether the server can serve.
+        "shared_key_configured": bool(FOUNDRYNET_API_KEY),
+        "upstream_auth":         "per_caller_key_passthrough",
         "transport":          "streamable-http",
-        "gating":             "per_client_fnet_2tier",
+        "gating":             "per_caller_tier_and_cap",
+        "oauth_token_issuance": oauth_enabled(),
         "supabase_configured": bool(os.environ.get("SUPABASE_URL")
                                     and os.environ.get("SUPABASE_SERVICE_KEY")),
         "pricing_url":        os.environ.get("MCP_PRICING_URL", "https://forge.foundrynet.io/pricing"),
@@ -1300,10 +1448,11 @@ async def server_card(request: Request) -> JSONResponse:
             "name":      "FoundryNet Forge",
             "tagline":   "Plain English in. Autonomous action out.",
             "description": (
-                "Watch any signal across 18 OEM families — Fanuc, Siemens, "
+                "Watch any signal across 45 vendor packs in 19 verticals — Fanuc, Siemens, "
                 "Haas, DMG Mori, Mazak, Okuma, Doosan, Makino, ABB, KUKA, "
                 "Universal Robots, Yaskawa, Stäubli, Trumpf, Bystronic, "
-                "Bosch Rexroth — backed by 18,785+ canonical field mappings. "
+                "Bosch Rexroth — backed by a corpus of 16,908 confirmed field "
+                "mappings, MIT-public at github.com/FoundryNet/canonical-schema. "
                 "When a condition matches, Forge fires the webhook or alert "
                 "you wired (Slack, Teams, PagerDuty, your MES, your own "
                 "endpoint) and logs a tamper-evident record of the "
@@ -1362,7 +1511,7 @@ async def server_card(request: Request) -> JSONResponse:
                 {"name": "identify_machine",
                  "description": "Provision a stable machine identity (mint_id) for an OEM/model/serial machine. Idempotent."},
                 {"name": "normalize_telemetry",
-                 "description": "Give an agent semantic understanding of machine data from any OEM: translate raw vendor telemetry into canonical FCS fields across 18 OEM families and 18,000+ field mappings."},
+                 "description": "Give an agent semantic understanding of machine data from any OEM: translate raw vendor telemetry into canonical FCS fields across 45 vendor packs in 19 verticals, from a corpus of 16,908 confirmed field mappings."},
                 {"name": "query_machine_history",
                  "description": "Read normalized operational history for a machine with field projection, time-range filters, and summary mode."},
                 {"name": "create_automation",
@@ -1481,7 +1630,7 @@ async def wellknown_mcp_json(request: Request) -> JSONResponse:
         "short_name": "foundrynet-forge",
         "description": ("Industrial AI infrastructure. MCP tools for cross-OEM "
                         "equipment normalization, prediction, and governance. "
-                        "18 OEM families, 189 canonical fields."),
+                        "45 vendor packs across 19 verticals, 366 canonical fields."),
         "version": "3.4.4",
         "url": endpoint,
         "endpoint": endpoint,
@@ -1508,8 +1657,8 @@ async def wellknown_agent_card(request: Request) -> JSONResponse:
     return JSONResponse({
         "name": "Forge by Foundry Labs",
         "description": ("Cross-OEM industrial telemetry normalization, runtime kernel, "
-                        "and machine identity for industrial equipment. 18 OEM families, "
-                        "189 canonical fields."),
+                        "and machine identity for industrial equipment. 45 vendor packs "
+                        "across 19 verticals, 366 canonical fields."),
         "url": "https://mcp.foundrynet.io/mcp",
         "version": "3.4.4",
         "capabilities": {"tools": ["normalize", "identify", "query_corpus",
@@ -1520,7 +1669,7 @@ async def wellknown_agent_card(request: Request) -> JSONResponse:
                         "verified_outputs": True},
         "protocols": {"mcp": {"endpoint": "https://mcp.foundrynet.io/mcp",
                               "transport": "streamable-http"}},
-        "contact": "forge@foundrynet.io",
+        "contact": "foundrynet@proton.me",
     }, headers={"Cache-Control": "public, max-age=300"})
 
 
@@ -1530,19 +1679,73 @@ async def wellknown_agent_card(request: Request) -> JSONResponse:
 #                                   existing /.well-known/agent-card.json stays)
 #   POST /a2a/tasks               — receive a task, map skill_id -> kernel call
 #   GET  /a2a/agents              — discover agents on this kernel, A2A-shaped
-# NOTE: custom routes bypass GatingMiddleware (it only gates MCP tools/call), so
-# these enforce auth explicitly via resolve_bearer. CAVEAT: _call_forge runs as
-# the server's own FOUNDRYNET_API_KEY, so premium skills execute under the
-# server identity and are NOT metered per-caller here — wire per-tier gating
-# before promoting the premium A2A skills heavily. (Tracked as a follow-up.)
+# Custom routes bypass GatingMiddleware (it only gates MCP tools/call), so these
+# enforce the gate explicitly — and through the SAME function, gating.enforce_call.
+#
+# They did not. `_a2a_auth` only proved the caller had *a* valid key, and then
+# `_a2a_dispatch` went straight to the kernel: no tier check, no monthly cap, no
+# payment gate, and the upstream call ran under the shared server key. So a free
+# forge_sandbox_ key that gets `payment_required` for `fleet_health` on
+# tools/call could get the same answer, unmetered and unlimited, by POSTing
+# skill_id=fleet_intelligence to /a2a/tasks — the identical bypass the tools/call
+# branch in gating.enforce_call was written to close, reopened on a second route.
+# Each A2A skill is now mapped to its MCP tool name and gated as that tool.
 
-# skill_id -> (kernel method, path builder, body/params builder from A2A params)
-def _a2a_auth(request: "Request") -> Optional[dict]:
-    """Return the caller's identity dict (resolve_bearer) or None if the
-    Authorization: Bearer <forge key | oauth JWT> is missing/invalid."""
+# A2A skill_id -> the MCP tool name it is, for gating purposes. An unmapped
+# skill is unknown, not free: _a2a_tool_for returns None and the route 400s
+# before any kernel call. Allowlist, never denylist.
+_A2A_SKILL_TO_TOOL = {
+    "normalize_telemetry": "normalize_telemetry",
+    "predict_failure":     "predict_breach",
+    "fleet_intelligence":  "fleet_health",
+    "diagnose":            "diagnose_machine",
+    "agent_trust":         "list_agents",
+}
+
+
+def _a2a_tool_for(skill_id: str) -> Optional[str]:
+    return _A2A_SKILL_TO_TOOL.get((skill_id or "").strip())
+
+
+def _a2a_auth(request: "Request") -> tuple[Optional[dict], str]:
+    """(caller identity dict, raw bearer) or (None, "") when missing/invalid."""
     authz = request.headers.get("authorization", "") or ""
     token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
-    return resolve_bearer(token) if token else None
+    if not token:
+        return None, ""
+    info = resolve_bearer(token)
+    return (info, token) if info is not None else (None, "")
+
+
+def _a2a_unauthorized() -> JSONResponse:
+    return JSONResponse(
+        {"error": "unauthorized",
+         "error_description": "Authorization: Bearer <Forge API key or OAuth JWT> required"},
+        status_code=401, headers={"WWW-Authenticate": 'Bearer realm="foundrynet-a2a"'})
+
+
+def _a2a_refused(exc: ToolError) -> JSONResponse:
+    """A gate refusal, relayed with the HTTP status its REST twin would use.
+
+    The gate's payloads are JSON strings so an MCP client can parse them; A2A
+    callers get the same object with the matching status, so the two transports
+    refuse identically rather than one of them looking like a server fault.
+    """
+    try:
+        payload = json.loads(str(exc))
+    except Exception:
+        payload = {"error": "refused", "message": str(exc)}
+    status = {
+        "missing_api_key":            401,
+        "invalid_api_key":            401,
+        "unknown_tool":               400,
+        "payment_method_required":    402,
+        "tool_requires_upgrade":      402,
+        "rate_limit_exceeded":        429,
+        "sandbox_cap_reached":        429,
+        "tenant_context_unavailable": 403,
+    }.get(str(payload.get("error") or ""), 400)
+    return JSONResponse(payload, status_code=status)
 
 
 async def _a2a_dispatch(skill_id: str, params: dict) -> Optional[dict]:
@@ -1596,7 +1799,7 @@ async def wellknown_a2a_agent_json(request: "Request") -> JSONResponse:
     return JSONResponse({
         "name": "Forge by Foundry Labs",
         "description": ("Industrial AI infrastructure. Connects AI agents to industrial "
-                        "equipment through 14 protocols. Cross-OEM normalization, "
+                        "equipment through 12 payload-decoding protocol adapters. Cross-OEM normalization, "
                         "physics-validated readings, health index, failure prediction, "
                         "and trust scoring for agents connected to this kernel."),
         "url": "https://mcp.foundrynet.io",
@@ -1606,7 +1809,7 @@ async def wellknown_a2a_agent_json(request: "Request") -> JSONResponse:
         "skills": [
             {"id": "normalize_telemetry", "name": "Normalize Equipment Telemetry",
              "description": ("Translate raw machine data from any OEM into a universal "
-                             "schema. 14 protocols, 18 manufacturers."),
+                             "schema. 12 payload-decoding protocols, 45 vendor packs."),
              "tags": ["industrial", "iot", "normalization", "manufacturing"],
              "examples": ["Normalize Fanuc CNC spindle data",
                           "Translate Siemens PLC readings to universal schema",
@@ -1652,19 +1855,21 @@ async def wellknown_a2a_agent_json(request: "Request") -> JSONResponse:
             "rest": {"endpoint": "https://forge.foundrynet.io",
                      "docs": "https://forge.foundrynet.io/docs"}},
         "provider": {"organization": "Foundry Labs", "url": "https://foundrynet.io",
-                     "contact": "forge@foundrynet.io"},
+                     "contact": "foundrynet@proton.me"},
     }, headers={"Cache-Control": "public, max-age=300"})
 
 
 @mcp.custom_route("/a2a/tasks", methods=["POST"])
 async def a2a_create_task(request: "Request") -> JSONResponse:
     """Receive a task from another A2A agent and map it to a kernel call.
-    Requires a valid Forge key or OAuth JWT (Authorization: Bearer ...)."""
-    if _a2a_auth(request) is None:
-        return JSONResponse(
-            {"error": "unauthorized",
-             "error_description": "Authorization: Bearer <Forge API key or OAuth JWT> required"},
-            status_code=401, headers={"WWW-Authenticate": 'Bearer realm="foundrynet-a2a"'})
+
+    Gated as the MCP tool the skill maps to, through gating.enforce_call, and
+    run under the caller's own upstream identity — the same rules tools/call
+    enforces, because they are the same function.
+    """
+    info, token = _a2a_auth(request)
+    if info is None:
+        return _a2a_unauthorized()
     try:
         body = await request.json()
     except Exception:
@@ -1673,9 +1878,25 @@ async def a2a_create_task(request: "Request") -> JSONResponse:
     params = body.get("params") or {}
     if not skill_id:
         return JSONResponse({"error": "skill_id is required"}, status_code=400)
-    result = await _a2a_dispatch(skill_id, params)
+    tool_name = _a2a_tool_for(skill_id)
+    if tool_name is None:
+        return JSONResponse({"error": f"Unknown skill: {skill_id}"}, status_code=400)
+    try:
+        enforce_call(tool_name, info)
+    except ToolError as e:
+        return _a2a_refused(e)
+    reset = bind_caller(info, token)
+    try:
+        result = await _a2a_dispatch(skill_id, params)
+    except TenantContextUnavailable as e:
+        return _a2a_refused(e.as_tool_error())
+    finally:
+        release_caller(reset)
     if result is None:
         return JSONResponse({"error": f"Unknown skill: {skill_id}"}, status_code=400)
+    # No cost-ledger write: forge-prod writes that row under this caller's own
+    # key id now that the upstream call authenticates as them. See
+    # gating.log_usage for why writing it here too double-counted.
     failed = isinstance(result, dict) and bool(result.get("error") or result.get("detail"))
     import uuid as _uuid
     return JSONResponse({
@@ -1688,12 +1909,20 @@ async def a2a_create_task(request: "Request") -> JSONResponse:
 
 @mcp.custom_route("/a2a/agents", methods=["GET"])
 async def a2a_list_agents(request: "Request") -> JSONResponse:
-    """Discover agents connected to this kernel, in A2A shape. Requires auth."""
-    if _a2a_auth(request) is None:
-        return JSONResponse(
-            {"error": "unauthorized",
-             "error_description": "Authorization: Bearer <Forge API key or OAuth JWT> required"},
-            status_code=401, headers={"WWW-Authenticate": 'Bearer realm="foundrynet-a2a"'})
+    """Discover agents connected to this kernel, in A2A shape.
+
+    Gated as `list_agents` and run under the caller's own upstream identity:
+    "agents connected to this kernel" is an account-scoped answer, and under
+    the shared key it was every tenant's agents.
+    """
+    info, token = _a2a_auth(request)
+    if info is None:
+        return _a2a_unauthorized()
+    try:
+        enforce_call("list_agents", info)
+    except ToolError as e:
+        return _a2a_refused(e)
+    reset = bind_caller(info, token)
     qp: dict = {}
     cap = request.query_params.get("capability")
     mt = request.query_params.get("min_trust_score")
@@ -1707,7 +1936,12 @@ async def a2a_list_agents(request: "Request") -> JSONResponse:
             pass
     if mid:
         qp["machine_id"] = mid
-    discovered = await _call_forge_raw("GET", "/v1/agents/discover", params=qp)
+    try:
+        discovered = await _call_forge_raw("GET", "/v1/agents/discover", params=qp)
+    except TenantContextUnavailable as e:
+        return _a2a_refused(e.as_tool_error())
+    finally:
+        release_caller(reset)
     # The kernel returns the agent list; relay it and add A2A-shaped cards.
     agents = []
     if isinstance(discovered, dict):
@@ -1852,6 +2086,32 @@ def build_dual_app():
             return await call_next(request)
 
     main_app.add_middleware(_OriginGuard)
+
+    # cacheScope, the half with teeth. Every /mcp, /sse, /messages and /a2a
+    # response body is derived from ONE tenant's data under ONE tenant's key, and
+    # there are HTTP caches in the path: Smithery proxies user traffic through its
+    # hosted gateway and mcp.foundrynet.io is Cloudflare-fronted. The transport
+    # default measured on this build is `no-cache, no-transform`, which PERMITS a
+    # cache to STORE the response and only requires it to revalidate — and a
+    # revalidation carries the NEXT caller's key. `no-store, private` is the
+    # directive that says do not keep this, and not for anyone else.
+    #
+    # The /.well-known/* discovery payloads are static, identical for every
+    # caller and read env only for booleans, so they keep their public 5-minute
+    # cache: making discovery uncacheable would cost every directory crawl a
+    # cold hit for no privacy gain. The allow-list is by PREFIX of the paths that
+    # are tenant-scoped, so a route added later is private by default.
+    _PRIVATE_PREFIXES = ("/mcp", "/sse", "/messages", "/a2a", "/oauth/token")
+
+    class _PrivateCacheScope(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            response = await call_next(request)
+            if request.url.path.startswith(_PRIVATE_PREFIXES):
+                response.headers["Cache-Control"] = "no-store, private"
+                response.headers["Vary"] = "Authorization"
+            return response
+
+    main_app.add_middleware(_PrivateCacheScope)
     return main_app
 
 
@@ -1859,7 +2119,7 @@ if __name__ == "__main__":
     import uvicorn
     logger.info(
         f"FoundryNet MCP starting on 0.0.0.0:{PORT} "
-        f"(forge={FORGE_BASE_URL}, key_configured={bool(FOUNDRYNET_API_KEY)}) "
+        f"(forge={FORGE_BASE_URL}, upstream auth: per-caller key) "
         f"— dual transport: /mcp (streamable-http) + /sse (legacy)"
     )
     uvicorn.run(build_dual_app(), host="0.0.0.0", port=PORT, log_level="warning")
