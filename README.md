@@ -63,7 +63,7 @@ payment gate, which made the A2A route a free pass to the paid inference tools.
 
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest pytest-asyncio
-.venv/bin/python -m pytest tests/ -q        # 99 checks
+.venv/bin/python -m pytest tests/ -q        # 229 checks
 scripts/release_gate.sh                     # tree, deps, import, suite, version
 ```
 
@@ -73,6 +73,49 @@ substitute RECORDS requests, because what identity this server presents to
 forge-prod is the thing most worth asserting. `tests/test_rest_mcp_parity.py`
 measures free-tier parity against forge-prod's own `_endpoint_to_billing_meter`,
 read out of its source at test time rather than copied.
+
+CI runs the whole tree on every push and pull request
+(`.github/workflows/release-gate.yml`, pinned to `ubuntu-24.04`). The 5 parity
+checks SKIP there, loudly and with their reason printed, because forge-prod is a
+separate private repo and is not on the runner — a visible skip beats a green
+tick over a check that was quietly dropped.
+
+## Deploying
+
+```
+cd ~/forge-mcp && git checkout main && git pull --ff-only && ./deploy.sh
+```
+
+Never `railway up` by hand. `deploy.sh` does seven things in order, and five of
+them exist because of a specific way a deploy has gone wrong:
+
+1. refuses a dirty tree or a branch that is not `main` — `railway up` uploads
+   the WORKING TREE, so with uncommitted changes no commit describes what ships;
+2. runs `scripts/release_gate.sh` and refuses if it is red. There is no override
+   flag, deliberately;
+3. takes a deploy lock (`~/.forge-mcp-deploy.lock`, atomic `mkdir`) so two
+   concurrent deploys cannot race on the upload and on the verification;
+4. refuses if `railway up` would archive the wrong directory. It archives the
+   CLOSEST LINKED project directory from `~/.railway/config.json`, walking UP —
+   not `$PWD`. This directory once inherited `$HOME`'s link, which names a
+   DIFFERENT SERVICE;
+5. runs `stamp_build.py`, which writes `build_info.json` (commit, dirty state,
+   `content_hash` over the uploaded file set, build time);
+6. `railway up --service 162115b7-…` — the id is explicit, because a bare
+   `railway up` resolves the service from that same ancestor link;
+7. polls `https://mcp.foundrynet.io/health` until `build.commit_short` AND
+   `build.content_hash` both equal the stamp it just wrote, then asserts the
+   status. Railway reporting SUCCESS only means the upload and build succeeded —
+   a crash-looping new container leaves the OLD one serving and the deploy looks
+   fine. `content_hash` is checked as well as the commit because `railway up`
+   uploads a *tree*: the same commit with a different tree is a different
+   deployment.
+
+`/health` carries a `build` block using the same key names as forge-prod's, so
+one verifier reads both services. When `build_info.json` is absent it says so in
+words — `build_info.json absent — deploy did not run stamp_build.py`, with
+`commit`, `content_hash` and `built_at` present and null — because a null that
+looks like a missing field is indistinguishable from a stamped build.
 
 ## Tools (32)
 
@@ -146,7 +189,10 @@ Get a free `fnet_` key at https://foundrynet.io/signup?utm_source=github&utm_med
 - `requirements.txt` — `fastmcp>=3.4.5,<4`, `httpx>=0.27`, `PyJWT>=2.14.0`, `supabase`, `stripe`
 - `tests/` — the behavioural suite (auth, tenancy, parity, idempotency, cache scope)
 - `scripts/release_gate.sh` — must be green on the exact commit before a deploy
-- `Procfile` — Railway start command (`web: python mcp_server.py`)
+- `deploy.sh` — the only path to production; gated, locked, stamped and verified
+- `stamp_build.py` — writes `build_info.json`; what `/health`'s `build` block reports
+- `Procfile` — Railway start command (stamps, then `python mcp_server.py`)
+- `.github/workflows/release-gate.yml` — CI; the whole suite on push and PR
 
 ## License
 

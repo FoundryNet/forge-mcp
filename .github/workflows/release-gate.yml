@@ -1,0 +1,346 @@
+# forge-mcp's release gate. THE FIRST CI THIS REPO HAS EVER HAD.
+#
+# WHY THIS EXISTS
+# ---------------
+# forge-mcp had no .github/workflows at all. Every change reached
+# mcp.foundrynet.io by `railway up` from a laptop, which uploads a WORKING
+# TREE, and nothing ran on the way: not a test, not an import check, not a
+# version-agreement check. The repo already HAD scripts/release_gate.sh --
+# five gates over tenancy, the auth matrix, REST/MCP parity, idempotency,
+# ownership and cache scope -- and nothing in any path to production ran it.
+# A gate nobody runs is documentation.
+#
+# WHAT RUNS HERE, AND WHAT DOES NOT
+# ---------------------------------
+# The ENTIRE tests/ tree runs. Nothing is excluded, because nothing in it
+# needs a credential or the network: conftest.py substitutes exactly two
+# things -- a fake Supabase whose rows have the same shape forge_api_keys
+# returns, and an httpx.MockTransport that records the upstream hop -- and the
+# tests drive the real ASGI app over the real Streamable HTTP transport through
+# the real GatingMiddleware.
+#
+# Two things DO degrade here, and both degrade VISIBLY rather than silently:
+#
+#   * tests/test_rest_mcp_parity.py asks forge-prod's own
+#     `_endpoint_to_billing_meter` whether a tool is free, by parsing
+#     ~/forge-prod/api.py. forge-prod is a separate private repo and is not on
+#     this runner, so 5 of its 9 checks SKIP with the reason printed by -rs
+#     below. They are not deleted and not mocked: a hand-copied list of free
+#     tool names is exactly the thing that drifts, and a green tick over an
+#     unrun parity check would be worse than a visible skip.
+#   * scripts/release_gate.sh's gate 2 builds a clean venv to prove
+#     requirements.txt resolves inside `fastmcp<4`. That is run here as its own
+#     step rather than by invoking the whole shell script, because the script
+#     also re-runs the suite and a gate that takes twice as long for the same
+#     information is a gate people start skipping.
+#
+# No step here needs a secret, so none is granted. If a future step does, it
+# is a PARKED item for the repo owner, not a token added quietly.
+name: release-gate
+
+# TRIGGERED ON BOTH EVENTS, DELIBERATELY REDUNDANTLY.
+#
+# Measured on forge-prod on 2026-10-05: `pull_request`-triggered jobs on this
+# org were not being allocated a runner at all. Four runs across PRs 55/56/57
+# sat queued with steps=0 and were killed by the job timeout at exactly
+# 15m02s, which GitHub then reports as `cancelled` -- indistinguishable, from
+# the PR page, from a test that failed. Over the same minutes, push-triggered
+# runs on the same commits were allocated a runner and finished in 10s.
+#
+# A push-event run posts its check against the same head SHA, so its verdict
+# appears on the PR regardless. Running on both events means a starved
+# pull_request run is no longer the only chance to get an answer. The two use
+# different `github.ref` values (refs/pull/N/merge vs refs/heads/<branch>), so
+# the concurrency group below does NOT make them cancel each other.
+on:
+  pull_request:
+    branches: [main]
+  push:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Job id is load-bearing: a required check would be named
+  # "release-gate / gate". Renaming this job silently un-protects main.
+  gate:
+    # RUNNER IS PINNED. `ubuntu-latest` migrates to Ubuntu 26 on 2026-10-19 and
+    # GitHub warns about it on every run. A release gate whose base image
+    # changes underneath it is the drift this gate exists to catch, so the
+    # version is explicit and moves when somebody decides to move it.
+    runs-on: ubuntu-24.04
+    # The WORK is ~3 minutes (the suite is ~85s, the deploy tests spawn a few
+    # hundred subprocesses). This budget is for the work, not for waiting on a
+    # runner: GitHub's own acquisition timeout fires first and annotates the run
+    # with "The job was not acquired by Runner of type hosted". Keeping this
+    # tight means a red gate means a red TEST -- the annotation distinguishes
+    # starvation, and `gh run rerun --failed` is the right response to it.
+    timeout-minutes: 12
+    steps:
+      # First step, so the log's first line proves a runner was acquired and
+      # the clock below measures WORK rather than queueing.
+      - name: Runner acquired
+        run: |
+          echo "runner=$RUNNER_NAME os=$RUNNER_OS arch=$RUNNER_ARCH"
+          echo "acquired_at=$(date -u +%FT%TZ)"
+          echo "GATE_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python3 -m pip install -q --upgrade pip
+          python3 -m pip install -q -r requirements.txt
+          # pytest-asyncio is what pytest.ini's `asyncio_mode = auto` is an
+          # option OF; without it every async test in the suite is collected
+          # and then skipped, which is a green tick over an unrun gate.
+          # <0.23 because 0.23 changed the default loop scope and the session
+          # fixtures in conftest.py are built on the 0.21 semantics.
+          python3 -m pip install -q 'pytest>=8' 'pytest-asyncio>=0.21,<0.23'
+
+      # Cheapest possible check, so it runs before anything that takes time.
+      # Gate 3 of scripts/release_gate.sh: the module must import and build its
+      # app with NO environment set. Gating must DEGRADE, never 500 at boot --
+      # a half-configured deploy that crashes on import takes the service down
+      # where it should have come up with gating disabled and said so.
+      - name: Imports and builds the app with no environment set
+        run: |
+          env -u SUPABASE_URL -u SUPABASE_SERVICE_KEY -u FOUNDRYNET_API_KEY \
+              -u MCP_JWT_SECRET -u STRIPE_SECRET_KEY -u ORIGIN_SHARED_SECRET \
+            python3 - <<'PY'
+          import mcp_server, gating
+          assert len(gating.ALL_TOOLS) == 32, len(gating.ALL_TOOLS)
+          app = mcp_server.build_dual_app()
+          assert app is not None
+          print(f"  imported clean; {len(gating.ALL_TOOLS)} tools in the registry")
+          PY
+
+      # Gate 2 of scripts/release_gate.sh. `fastmcp<4` is load-bearing: 4.x is
+      # the 2026-07-28 stateless spec line and drops the 3.x compat shims this
+      # tool surface is built on, so a relaxed bound is a silent rewrite of the
+      # server. PyJWT>=2.14.0 is the floor the OAuth client-credentials path
+      # depends on for `options={"require": [...]}` handling.
+      - name: Pinned dependency bounds hold
+        run: |
+          python3 - <<'PY'
+          import sys
+          from importlib.metadata import version
+          fm = version("fastmcp")
+          jw = version("PyJWT")
+          def tup(v): return tuple(int(x) for x in v.split(".")[:2] if x.isdigit())
+          bad = []
+          if tup(fm)[0] != 3:
+              bad.append(f"fastmcp resolved to {fm}; the <4 pin is what holds "
+                         f"the tool surface together")
+          if tup(jw) < (2, 14):
+              bad.append(f"PyJWT {jw} is below the 2.14.0 floor")
+          for b in bad:
+              print(f"  FAIL {b}")
+          print(f"  fastmcp {fm} · PyJWT {jw}")
+          sys.exit(1 if bad else 0)
+          PY
+
+      # NO TEST FILE MAY BE SILENTLY LEFT OUT. The suite list below is written
+      # out by name so a reader can see what runs; this step fails if any
+      # tests/test_*.py in the tree is missing from it. A test added in a PR
+      # that nobody wired into CI is indistinguishable, from the green tick,
+      # from a test that passed.
+      - name: Every test file is in the suite list
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          wf = pathlib.Path(".github/workflows/release-gate.yml").read_text()
+          # Only the pytest invocation counts as "listed". Scanning the whole
+          # file would let a comment that merely MENTIONS a test file satisfy
+          # this check -- which is precisely the class of mistake it exists to
+          # catch, and several comments above do mention test files by name.
+          # Only the text between the SUITE-BEGIN / SUITE-END sentinels counts
+          # as "listed". Scanning the whole file would let a comment that merely
+          # MENTIONS a test file satisfy this check -- which is precisely the
+          # class of mistake it exists to catch, and several comments in this
+          # file do name test files. Anchoring on a step name would also match
+          # this step's OWN source, which is how the first version of this
+          # check found nothing at all.
+          if "SUITE-BEGIN" not in wf or "SUITE-END" not in wf:
+              sys.exit("the SUITE-BEGIN/SUITE-END sentinels are gone, so this "
+                       "check can no longer see what the suite runs")
+          # The LAST SUITE-BEGIN is the array's; the occurrences above are this
+          # step's own source, which is why anchoring on a step name found
+          # nothing in the first version of this check.
+          block = wf.rsplit("SUITE-BEGIN", 1)[1].split("SUITE-END", 1)[0]
+          listed = set(re.findall(r"tests/(test_[A-Za-z0-9_]+\.py)", block))
+          if not listed:
+              sys.exit("the sentinels enclose no test files; the suite list "
+                       "moved and this check is now measuring nothing")
+          on_disk = {p.name for p in pathlib.Path("tests").glob("test_*.py")}
+          missing = sorted(on_disk - listed)
+          stale = sorted(listed - on_disk)
+          if missing:
+              print("  FAIL these test files exist but no step runs them:")
+              for m in missing:
+                  print(f"         tests/{m}")
+          if stale:
+              print("  FAIL the suite list names files that do not exist:")
+              for s in stale:
+                  print(f"         tests/{s}")
+          if not (missing or stale):
+              print(f"  all {len(on_disk)} test files are in the suite list")
+          sys.exit(1 if (missing or stale) else 0)
+          PY
+
+      # THE SUITE. Exit status is the verdict; the floor below guards against
+      # the OTHER failure -- a collection error or a bad conftest that makes
+      # pytest exit 0 having run almost nothing. NO EXPECTED PASS OR FAIL COUNT
+      # IS PINNED: a hardcoded number turns every added test into a red gate,
+      # which is how a gate comes to be edited rather than read.
+      #
+      # -rs prints every skip with its reason, so the parity checks that need
+      # forge-prod on disk are VISIBLE as skips rather than invisible as
+      # not-run.
+      - name: Behavioural suite
+        run: |
+          SUITES=(
+            # SUITE-BEGIN  (the step above fails if a tests/test_*.py is not here)
+            tests/test_a2a_gate.py
+            tests/test_auth_and_ownership.py
+            tests/test_build_stamp_and_health.py
+            tests/test_cache_scope.py
+            tests/test_cost_ledger_single_writer.py
+            tests/test_deploy_verifies_what_it_shipped.py
+            tests/test_idempotency.py
+            tests/test_rest_mcp_parity.py
+            tests/test_smoke_transport.py
+            tests/test_tenancy_isolation.py
+            tests/test_tool_surface.py
+            # SUITE-END
+          )
+          set +e
+          python3 -m pytest -q -p no:cacheprovider -rs \
+            --junit-xml=junit.xml "${SUITES[@]}" 2>&1 | tee pytest.out
+          status=${PIPESTATUS[0]}
+          set -e
+          python3 - "$status" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import sys, xml.etree.ElementTree as ET
+          status = int(sys.argv[1])
+          # A FLOOR, not an exact count. It is deliberately well below the
+          # current total so adding tests never turns the gate red, while a
+          # collection error that runs 3 checks and exits 0 still does.
+          FLOOR = 180
+          t = ET.parse("junit.xml").getroot()
+          s = t[0] if t.tag == "testsuites" else t
+          n = int(s.get("tests", 0))
+          fail = int(s.get("failures", 0)) + int(s.get("errors", 0))
+          skip = int(s.get("skipped", 0))
+          print(f"### release-gate")
+          print(f"- collected **{n}** checks · {fail} failed · {skip} skipped")
+          print(f"- pytest exit status **{status}**")
+          bad = []
+          if status != 0:
+              bad.append(f"pytest exited {status}")
+          if n < FLOOR:
+              bad.append(f"only {n} checks were collected (floor {FLOOR}); "
+                         f"something is not being run")
+          for b in bad:
+              print(f"- **FAIL** {b}")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Stamping is wired
+        # A deploy that cannot stamp itself reports a stale commit and
+        # content_hash on /health -- or, as forge-mcp did until this change,
+        # nothing at all. Assert the runtime path exists and is reachable from
+        # the start command, then exercise it end to end with Railway's own
+        # injected identity.
+        run: |
+          test -f stamp_build.py
+          grep -q 'stamp_build.py --runtime' Procfile \
+            || { echo "Procfile does not stamp at start"; exit 1; }
+          python3 - <<'PY'
+          import ast
+          t = ast.parse(open("stamp_build.py").read())
+          names = {n.name for n in ast.walk(t)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+          missing = {"railway_identity", "build", "content_hash"} - names
+          assert not missing, f"stamp_build.py missing {missing}"
+          print("  stamp_build.py exposes railway_identity/build/content_hash")
+          PY
+          RAILWAY_GIT_COMMIT_SHA=$(git rev-parse HEAD) \
+          RAILWAY_GIT_BRANCH=gate-selftest \
+          python3 stamp_build.py --runtime
+          python3 - <<'PY'
+          import json, subprocess
+          d = json.load(open("build_info.json"))
+          want = subprocess.run(["git", "rev-parse", "HEAD"],
+                                capture_output=True, text=True).stdout.strip()
+          assert d["commit"] == want, f"stamped {d['commit']} != {want}"
+          assert d["dirty"] is False
+          assert d["identity_source"] == "railway_git_env"
+          assert d["content_hash"].startswith("sha256:")
+          print(f"  stamp self-test OK: {d['commit_short']} {d['content_hash'][:26]}")
+          PY
+          # And /health must actually serve it back, under the key names
+          # deploy.sh polls for. The stamp existing on disk is not the property;
+          # the property is that a verifier can READ it off the live service.
+          python3 - <<'PY'
+          import importlib, json
+          import mcp_server
+          importlib.reload(mcp_server)
+          from starlette.testclient import TestClient
+          b = TestClient(mcp_server.build_dual_app()).get("/health").json()["build"]
+          assert b["commit_short"] and b["content_hash"].startswith("sha256:"), b
+          print(f"  /health serves commit_short={b['commit_short']} "
+                f"content_hash={b['content_hash'][:26]}")
+          PY
+          rm -f build_info.json
+
+      - name: The deploy script is syntactically valid and refuses by default
+        # deploy.sh is the only path to production. A syntax error in it is a
+        # broken deploy discovered at the worst possible moment, and `bash -n`
+        # costs nothing. The behavioural guards are measured in
+        # tests/test_deploy_verifies_what_it_shipped.py above.
+        run: |
+          bash -n deploy.sh
+          bash -n scripts/release_gate.sh
+          echo "  deploy.sh and scripts/release_gate.sh parse"
+
+      - name: Version agreement
+        # Gate 5 of scripts/release_gate.sh. FastMCP without `version=` reports
+        # its OWN library version in the handshake, so serverInfo once
+        # advertised whatever fastmcp release was built last instead of ours.
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, sys
+          src = pathlib.Path("mcp_server.py").read_text()
+          m = re.search(r'FastMCP\(\s*"foundrynet"\s*,\s*version="([^"]+)"', src)
+          if not m:
+              sys.exit("mcp_server.py: FastMCP() has no version= — serverInfo "
+                       "would report the fastmcp LIBRARY version to every client")
+          code = m.group(1)
+          decl = json.loads(pathlib.Path("server.json").read_text())["version"]
+          if code != decl:
+              sys.exit(f"serverInfo.version={code} but server.json says {decl}")
+          print(f"  version {code} agrees across mcp_server.py and server.json")
+          PY
+
+      - name: Gate duration
+        if: always()
+        run: |
+          # Printed so a slow gate is visible as a number rather than as a
+          # feeling, and so starvation (which happens BEFORE this job) can
+          # never be confused with slow work (which shows up here).
+          echo "gate work took $(( $(date +%s) - GATE_START ))s" \
+            | tee -a "$GITHUB_STEP_SUMMARY"

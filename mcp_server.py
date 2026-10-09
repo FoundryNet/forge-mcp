@@ -1390,13 +1390,57 @@ async def sandbox_echo(request: Request) -> JSONResponse:
     })
 
 
+# ── build provenance ────────────────────────────────────────────────────────
+# Written by stamp_build.py: by deploy.sh immediately before `railway up`, and
+# by the Procfile start command on a GitHub-connected deploy. Read ONCE at
+# import so /health costs nothing, and so a file appearing later cannot change
+# what an already-running process claims about itself.
+#
+# BEFORE THIS, /health carried no build identity at all -- no commit, no content
+# hash, no build time. Every field it reported (tools_count, forge_base_url, the
+# configuration booleans) was true of every build this service has ever had, so
+# "what is running?" was unanswerable and deploy verification was impossible.
+#
+# Key names match forge-prod's /health exactly, so one verifier reads both.
+def _load_build_info() -> dict:
+    try:
+        _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "build_info.json")
+        with open(_p) as _f:
+            return json.load(_f)
+    except Exception:
+        # An absent stamp is reported AS A SENTENCE, not as a missing field.
+        # A null that looks like an unset key is indistinguishable from a
+        # stamped build whose commit happened to be empty; a deploy that
+        # skipped stamp_build.py has to be visible on sight. commit,
+        # content_hash and built_at are present and explicitly null so that a
+        # verifier reading them gets null rather than KeyError.
+        return {"stamped": False,
+                "service": "foundrynet-mcp",
+                "commit": None,
+                "commit_short": None,
+                "content_hash": None,
+                "built_at": None,
+                "note": "build_info.json absent — deploy did not run stamp_build.py"}
+
+
+_BUILD_INFO = _load_build_info()
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
     """Health check for Railway + load balancers. Reports config presence
-    without ever leaking the API key value."""
+    without ever leaking the API key value.
+
+    `build` is the deploy-verification surface: deploy.sh polls here until
+    build.commit_short AND build.content_hash equal the stamp it just wrote.
+    Railway reporting SUCCESS only means the upload and build succeeded -- a
+    crash-looping new container leaves the OLD one serving, and this block is
+    the only thing that can tell the difference."""
     return JSONResponse({
         "status":             "ok",
         "service":            "foundrynet-mcp",
+        "build":              _BUILD_INFO,
         # Registry-derived; the single source of truth other surfaces read from.
         "tools_count":        len(await mcp.list_tools()),
         "forge_base_url":     FORGE_BASE_URL,
