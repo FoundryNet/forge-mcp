@@ -21,13 +21,18 @@
 #
 # Two things DO degrade here, and both degrade VISIBLY rather than silently:
 #
-#   * tests/test_rest_mcp_parity.py asks forge-prod's own
-#     `_endpoint_to_billing_meter` whether a tool is free, by parsing
-#     ~/forge-prod/api.py. forge-prod is a separate private repo and is not on
-#     this runner, so 5 of its 9 checks SKIP with the reason printed by -rs
-#     below. They are not deleted and not mocked: a hand-copied list of free
-#     tool names is exactly the thing that drifts, and a green tick over an
-#     unrun parity check would be worse than a visible skip.
+#   * SIX checks read forge-prod's api.py off the local disk and SKIP without
+#     it, with the reason printed by -rs below. Five are in
+#     tests/test_rest_mcp_parity.py, which asks forge-prod's own
+#     `_endpoint_to_billing_meter` whether a tool is free rather than trusting
+#     a copied list of names; the sixth is
+#     tests/test_cost_ledger_single_writer.py::test_forge_prod_still_writes_the_row_for_a_customer_key_call,
+#     which checks that the service we stopped writing the ledger row from is
+#     still the one writing it. forge-prod is a separate private repo and is
+#     not on this runner. They are not deleted and not mocked: a hand-copied
+#     list of free tool names is exactly the thing that drifts, and a green
+#     tick over an unrun cross-repo check would be worse than a visible skip.
+#     MEASURED on run 37907411494: 223 passed, 6 skipped, 229 collected.
 #   * scripts/release_gate.sh's gate 2 builds a clean venv to prove
 #     requirements.txt resolves inside `fastmcp<4`. That is run here as its own
 #     step rather than by invoking the whole shell script, because the script

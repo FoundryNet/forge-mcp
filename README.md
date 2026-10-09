@@ -75,10 +75,12 @@ measures free-tier parity against forge-prod's own `_endpoint_to_billing_meter`,
 read out of its source at test time rather than copied.
 
 CI runs the whole tree on every push and pull request
-(`.github/workflows/release-gate.yml`, pinned to `ubuntu-24.04`). The 5 parity
-checks SKIP there, loudly and with their reason printed, because forge-prod is a
-separate private repo and is not on the runner — a visible skip beats a green
-tick over a check that was quietly dropped.
+(`.github/workflows/release-gate.yml`, pinned to `ubuntu-24.04`): measured
+**223 passed, 6 skipped, 229 collected** in 2m04s. The 6 skips are the checks
+that read forge-prod's `api.py` off the local disk — 5 parity plus the
+cost-ledger single-writer check — and they skip loudly, with their reason
+printed, because forge-prod is a separate private repo and is not on the runner.
+A visible skip beats a green tick over a check that was quietly dropped.
 
 ## Deploying
 
