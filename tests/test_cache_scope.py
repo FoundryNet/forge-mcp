@@ -27,7 +27,8 @@ from identities import SANDBOX_KEY, TENANT_A_KEY
 from mcp_client import MCPSession, app_client, session
 from toolargs import ARGS
 
-pytestmark = pytest.mark.asyncio
+# asyncio_mode = auto in pytest.ini marks the async tests; an explicit module
+# mark also lands on the sync ones and emits a warning per test.
 
 PRIVATE_PATHS = ["/mcp", "/sse", "/messages", "/a2a/tasks", "/a2a/agents", "/oauth/token"]
 PUBLIC_PATHS = ["/.well-known/mcp/server-card.json", "/.well-known/agent.json",

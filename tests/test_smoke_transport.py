@@ -6,7 +6,8 @@ import pytest
 from identities import TENANT_A_KEY
 from mcp_client import session
 
-pytestmark = pytest.mark.asyncio
+# asyncio_mode = auto in pytest.ini marks the async tests; an explicit module
+# mark also lands on the sync ones and emits a warning per test.
 
 
 async def test_initialize_and_list_tools():

@@ -43,7 +43,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -449,12 +449,17 @@ class CallerIdentity:
     caller authenticated with one. It never appears in a log line, an error
     payload or a ledger row — only in the Authorization header of the upstream
     request it belongs to.
+
+    `repr=False` on that field is not decoration. Nothing prints this object
+    today, but a frozen dataclass's generated `repr` would include the live
+    customer credential, and it is one `tracebacks_show_locals=True`, one error
+    reporter, or one `logger.debug(f"{caller}")` away from a key in a log line.
     """
     key_id: str
     user_id: str
     entitlement: str
     via: str
-    upstream_key: Optional[str] = None
+    upstream_key: Optional[str] = field(default=None, repr=False)
 
     @property
     def can_scope_upstream(self) -> bool:
@@ -472,11 +477,15 @@ def current_caller() -> Optional[CallerIdentity]:
 def bind_caller(info: dict, token: str) -> Any:
     """Bind the resolved caller for the duration of this request.
 
-    Returns the ContextVar reset token. The raw bearer is kept ONLY when it is
-    a Forge API key: a JWT is not a credential forge-prod accepts, so storing
-    it would create an upstream identity that cannot actually be used.
+    Returns the ContextVar reset token. The raw bearer is kept ONLY when the
+    resolver NAMED the method as a raw Forge API key. A JWT is not a credential
+    forge-prod accepts, so storing it would create an upstream identity that
+    cannot be used — and an auth method that names itself nothing at all must
+    not inherit the permissive branch. `resolve_bearer` always sets `via`;
+    defaulting the unknown case to "key" would mean a future auth path that
+    forgot to set it silently forwarded whatever string the caller presented.
     """
-    via = (info.get("via") or "key").strip().lower()
+    via = (info.get("via") or "").strip().lower()
     return _CALLER.set(CallerIdentity(
         key_id=info.get("key_id") or "",
         user_id=info.get("user_id") or "",
@@ -760,16 +769,30 @@ def _insert_usage_row(key_id: str, tool_name: str, cost: float) -> None:
 
 
 async def log_usage(key_id: Optional[str], tool_name: str, cost: float) -> None:
-    """Fire-and-forget cost-ledger write for one tool call, keyed on the REAL
-    caller's key_id (from resolve_bearer). Non-blocking and fully fail-open —
-    supabase-py is sync so the insert runs in a worker thread; a ledger failure
-    must never surface to the tool caller. VISIBILITY ONLY — does not charge."""
-    if not key_id or not tool_name:
-        return
-    try:
-        await asyncio.to_thread(_insert_usage_row, key_id, tool_name, float(cost or 0.0))
-    except Exception as e:
-        logger.debug(f"gating: log_usage skipped: {type(e).__name__}: {e}")
+    """RETIRED. forge-prod writes this row now, and writing it here too puts the
+    same call in `forge_api_usage` twice.
+
+    This existed because the proxy authenticated as itself: forge-prod skipped
+    its own ledger write for a call carrying a proven `X-Forge-Origin: mcp`
+    ("the MCP gating middleware logs those under the real caller's key, so
+    logging here would mis-attribute and double-count"), and this function was
+    the half that did the logging.
+
+    Both halves of that arrangement are gone. The proxy now presents the
+    CALLER's key, so forge-prod's `_trusted_origin_label` does not honour the
+    origin claim — a customer key carries no `metadata.trusted_origin` — the
+    skip condition `_origin != "mcp"` is true, and forge-prod logs the row
+    itself, under the caller's own key id, with its abstention-aware cost. Two
+    writers, one table, the same `api_key_id`: `GET /v1/usage/summary` would sum
+    every MCP call twice, at two different prices, and forge-prod's own comment
+    names that outcome — "the ledger and the meter disagreeing is how a customer
+    comes to be invoiced one number and shown another."
+
+    Kept as a no-op rather than deleted so an older call site cannot silently
+    resurrect the second writer. Found by independent review of the tenancy
+    change, 2026-10-08; asserted by tests/test_cost_ledger_single_writer.py.
+    """
+    return
 
 
 # ── The middleware itself ────────────────────────────────────────────────────
@@ -912,6 +935,28 @@ def enforce_call(tool_name: str, info: dict) -> tuple[str, int, int]:
     limit — the exact bypass the tools/call branch below was written to close,
     reopened on a second route. Two gates is one gate too many.
     """
+    # Can this caller be executed AT ALL? Asked first, before the counter,
+    # because a call that cannot succeed must not cost the caller their
+    # allowance. An OAuth access token carries a key id but not a key, so it
+    # cannot be presented to forge-prod on the caller's behalf — and the refusal
+    # used to come from the upstream hop, i.e. AFTER check_and_increment had
+    # already spent one of 100 monthly calls, and after fire_sandbox had spent
+    # one of its ten LIFETIME fires and really posted to the sandbox endpoint.
+    # Measured by independent review: 31 of a JWT caller's monthly calls burned
+    # on 32 refusals.
+    via = (info.get("via") or "").strip().lower()
+    if via != "key":
+        raise TenantContextUnavailable(
+            "oauth_token_cannot_be_scoped" if via == "jwt" else "caller_unidentified",
+            "This call authenticated with an OAuth access token, which carries a "
+            "key id but not a Forge API key, so it cannot be presented to "
+            "forge-prod on your behalf and the call cannot be scoped to your "
+            "tenant. Re-authenticate with "
+            "`Authorization: Bearer <your Forge API key>`."
+            if via == "jwt" else
+            "The caller could not be named to forge-prod, so the call cannot be "
+            "scoped or attributed to a tenant. Refused.").as_tool_error()
+
     ent = _entitlement(info)
     info["_entitlement"] = ent
 
@@ -1018,6 +1063,18 @@ class GatingMiddleware(Middleware):
         # hop has no caller and refuses, rather than running as everyone.
         reset = bind_caller(info, token)
         try:
+            # Prove the identity is USABLE here, not at the upstream hop.
+            # fastmcp converts any exception raised inside `call_next` into
+            # `ToolError(f"Error calling tool {name!r}: {e}")` one layer below
+            # this middleware, so a refusal raised down there reaches the client
+            # as prose instead of the structured payload, and logs an
+            # ERROR-level traceback for a routine refusal. Asking here means the
+            # refusal is shaped by the gate that owns it.
+            try:
+                upstream_identity()
+            except TenantContextUnavailable as e:
+                raise e.as_tool_error() from None
+
             # Stash tier so tools could surface it via meta if useful later.
             try:
                 ctx = getattr(context, "fastmcp_context", None)
@@ -1042,14 +1099,8 @@ class GatingMiddleware(Middleware):
         finally:
             release_caller(reset)
 
-        # Per-tool cost ledger (visibility only; never charges). Logged AFTER a
-        # successful call, keyed on the REAL caller's key_id. Free tools log at
-        # 0.00 so call volume is visible. Fire-and-forget: a ledger failure must
-        # never affect the tool response.
-        try:
-            asyncio.create_task(
-                log_usage(info.get("key_id"), tool_name, TOOL_COSTS.get(tool_name, 0.0)))
-        except Exception:
-            pass
-
+        # No cost-ledger write here. forge-prod writes that row, under this
+        # caller's own key id, now that the upstream call authenticates as them
+        # — see log_usage's docstring for why writing it here too put every MCP
+        # call in forge_api_usage twice.
         return result

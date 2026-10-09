@@ -74,8 +74,9 @@ PORT               = int(os.environ.get("PORT", "8080"))
 
 if not FOUNDRYNET_API_KEY:
     logger.warning(
-        "FOUNDRYNET_API_KEY is not set — every tool call will return a 401. "
-        "Set it via the Railway dashboard before traffic hits this server."
+        "FOUNDRYNET_API_KEY is not set. This no longer affects tool calls — "
+        "each one authenticates upstream as its own caller — so the server is "
+        "fully functional without it. Kept only for the /health config report."
     )
 
 # version= is required: without it FastMCP reports its OWN library version as
@@ -181,11 +182,71 @@ RETRYABLE_EXCEPTIONS = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProto
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _NEVER_DELIVERED = (httpx.ConnectError,)
 
+# POST paths that are DECLARED to have no effect the kernel keeps.
+#
+# Method alone was too blunt. Most of Forge's valuable calls are POSTs that
+# compute and return — the whole TimesFM set, the anomaly and intelligence
+# chains, the guardrail DRY RUN, and /v1/identify, whose own tool docstring says
+# "Idempotent." Those are also the SLOWEST calls on the service (REQUEST_TIMEOUT
+# defaults to 120s precisely for them), so ReadTimeout is their most likely
+# failure, and withholding the retry traded a duplicate-write risk on four
+# endpoints for a new failure mode on ten that were safe.
+#
+# This is an ALLOWLIST and it is the list that grows; the unsafe set
+# (/v1/settle, /v1/verify_record, /v1/normalize, /v1/triggers/*) is the small
+# stable one. A path not named here is not retried after delivery, so adding a
+# mutating endpoint later inherits the safe behaviour by default.
+#
+# `/v1/predict_breach` is conditional: with `settle=true` it SETTLES, which is a
+# write, so the body decides. A caller-supplied flag narrowing the check is the
+# only direction allowed here — it can withhold a retry, never grant one.
+_SAFE_POST_PATHS = frozenset({
+    "/v1/predict",
+    "/v1/predict_batch",
+    "/v1/remaining_life",
+    "/v1/fleet_health",
+    "/v1/anomaly",
+    "/v1/machine_intelligence",
+    "/v1/guardrails/check",
+    "/v1/identify",
+})
+_SAFE_POST_PREFIXES = ("/v1/diagnose/",)
+# Safe only when the request does not ask for a side effect, keyed on the field
+# that causes one.
+_CONDITIONALLY_SAFE_POSTS = {"/v1/predict_breach": "settle"}
 
-def _may_retry(method: str, exc: BaseException) -> bool:
+
+def _post_has_no_effect(path: str, body: Optional[dict]) -> bool:
+    p = "/" + (path or "").strip("/")
+    if p in _SAFE_POST_PATHS:
+        return True
+    if any(p.startswith(x) for x in _SAFE_POST_PREFIXES):
+        return True
+    flag = _CONDITIONALLY_SAFE_POSTS.get(p)
+    if flag is not None:
+        # Absent or falsey means no side effect. Anything else, including a
+        # value we cannot read, resolves to "it might settle".
+        return not bool((body or {}).get(flag))
+    return False
+
+
+def _may_retry(method: str, exc: BaseException, path: str = "",
+               body: Optional[dict] = None) -> bool:
+    """Whether this exact request may be sent a second time.
+
+    Three inputs, in the order they settle the question:
+      * the method, because a safe method has no effect to duplicate;
+      * the exception, because a ConnectError proves nothing was delivered;
+      * the path and body, because a POST that only computes has nothing to
+        duplicate either — but only when it is declared so.
+    """
     if (method or "").upper() in _IDEMPOTENT_METHODS:
         return True
-    return isinstance(exc, _NEVER_DELIVERED)
+    if isinstance(exc, _NEVER_DELIVERED):
+        return True
+    if (method or "").upper() == "POST" and _post_has_no_effect(path, body):
+        return True
+    return False
 
 
 async def _call_forge_raw(method: str, path: str, *,
@@ -216,7 +277,7 @@ async def _call_forge_raw(method: str, path: str, *,
                                          params=params)
         except RETRYABLE_EXCEPTIONS as e:
             last_exc = e
-            if attempt == 0 and _may_retry(method, e):
+            if attempt == 0 and _may_retry(method, e, path, body):
                 logger.info(f"_call_forge_raw transient {type(e).__name__} on {method} {path}, retrying in {RETRY_DELAY_SECONDS}s")
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
                 continue
@@ -1339,9 +1400,13 @@ async def health(request: Request) -> JSONResponse:
         # Registry-derived; the single source of truth other surfaces read from.
         "tools_count":        len(await mcp.list_tools()),
         "forge_base_url":     FORGE_BASE_URL,
-        "key_configured":     bool(FOUNDRYNET_API_KEY),
+        # Reported, not required: tool calls authenticate upstream as the
+        # caller, so this says nothing about whether the server can serve.
+        "shared_key_configured": bool(FOUNDRYNET_API_KEY),
+        "upstream_auth":         "per_caller_key_passthrough",
         "transport":          "streamable-http",
-        "gating":             "per_client_fnet_2tier",
+        "gating":             "per_caller_tier_and_cap",
+        "oauth_token_issuance": oauth_enabled(),
         "supabase_configured": bool(os.environ.get("SUPABASE_URL")
                                     and os.environ.get("SUPABASE_SERVICE_KEY")),
         "pricing_url":        os.environ.get("MCP_PRICING_URL", "https://forge.foundrynet.io/pricing"),
@@ -1386,7 +1451,8 @@ async def server_card(request: Request) -> JSONResponse:
                 "Watch any signal across 45 vendor packs in 19 verticals — Fanuc, Siemens, "
                 "Haas, DMG Mori, Mazak, Okuma, Doosan, Makino, ABB, KUKA, "
                 "Universal Robots, Yaskawa, Stäubli, Trumpf, Bystronic, "
-                "Bosch Rexroth — backed by 18,785+ canonical field mappings. "
+                "Bosch Rexroth — backed by a corpus of 16,908 confirmed field "
+                "mappings, MIT-public at github.com/FoundryNet/canonical-schema. "
                 "When a condition matches, Forge fires the webhook or alert "
                 "you wired (Slack, Teams, PagerDuty, your MES, your own "
                 "endpoint) and logs a tamper-evident record of the "
@@ -1828,12 +1894,9 @@ async def a2a_create_task(request: "Request") -> JSONResponse:
         release_caller(reset)
     if result is None:
         return JSONResponse({"error": f"Unknown skill: {skill_id}"}, status_code=400)
-    # The cost ledger, keyed on the real caller — as on tools/call.
-    try:
-        asyncio.create_task(gating.log_usage(info.get("key_id"), tool_name,
-                                             gating.TOOL_COSTS.get(tool_name, 0.0)))
-    except Exception:
-        pass
+    # No cost-ledger write: forge-prod writes that row under this caller's own
+    # key id now that the upstream call authenticates as them. See
+    # gating.log_usage for why writing it here too double-counted.
     failed = isinstance(result, dict) and bool(result.get("error") or result.get("detail"))
     import uuid as _uuid
     return JSONResponse({
@@ -2056,7 +2119,7 @@ if __name__ == "__main__":
     import uvicorn
     logger.info(
         f"FoundryNet MCP starting on 0.0.0.0:{PORT} "
-        f"(forge={FORGE_BASE_URL}, key_configured={bool(FOUNDRYNET_API_KEY)}) "
+        f"(forge={FORGE_BASE_URL}, upstream auth: per-caller key) "
         f"— dual transport: /mcp (streamable-http) + /sse (legacy)"
     )
     uvicorn.run(build_dual_app(), host="0.0.0.0", port=PORT, log_level="warning")

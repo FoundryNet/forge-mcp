@@ -17,7 +17,7 @@ import pytest
 import gating
 import mcp_server
 from identities import (
-    SERVER_SHARED_KEY,
+    SERVER_SHARED_KEY,  # noqa: F401 — used by the leak assertions
     TENANT_A_KEY,
     TENANT_A_KEY_ID,
     TENANT_B_KEY,
@@ -26,7 +26,8 @@ from identities import (
 from mcp_client import session
 from toolargs import ARGS
 
-pytestmark = pytest.mark.asyncio
+# asyncio_mode = auto in pytest.ini marks the async tests; an explicit module
+# mark also lands on the sync ones and emits a warning per test.
 
 
 async def _registry_names():
@@ -160,6 +161,94 @@ def test_no_upstream_header_builder_reads_the_shared_key():
                  and ("Authorization" in ln or "Bearer" in ln)]
     assert not offending, (
         f"the shared server key is being put on a request again: {offending}")
+
+
+async def test_an_oauth_caller_gets_a_PARSEABLE_refusal_over_the_wire(upstream):
+    """Review gap: the refusal was only ever asserted by calling `_headers()`
+    directly, so nobody noticed the over-the-wire shape was prose.
+
+    fastmcp turns any exception raised INSIDE `call_next` into
+    `ToolError(f"Error calling tool {name!r}: {e}")` one layer below the
+    middleware, so a refusal raised at the upstream hop reached the client as a
+    sentence — unparseable by the agent it is meant to redirect — and logged an
+    ERROR traceback for a routine refusal on every call. The gate now refuses
+    before `call_next`. n = 32 tools.
+    """
+    import gating as g
+    from mcp_client import MCPSession, app_client
+
+    if not g.oauth_enabled():
+        pytest.skip("OAuth signing not configured in this harness")
+    minted = g.issue_access_token("harness", TENANT_A_KEY)
+    assert minted and minted.get("access_token")
+
+    names = await _registry_names()
+    async with app_client() as client:
+        s = MCPSession(client, minted["access_token"])
+        await s.initialize()
+        for name in names:
+            upstream.reset()
+            out = await s.call(name, ARGS[name])
+            assert not out["ok"], f"{name} ran under an OAuth token"
+            assert out["error"].get("error") == "tenant_context_unavailable", (
+                f"{name} refused unparseably: {out['error']}")
+            assert out["error"].get("reason") == "oauth_token_cannot_be_scoped", out["error"]
+            assert SERVER_SHARED_KEY not in (out.get("text") or "")
+            assert upstream.forge_requests == [], f"{name} reached the kernel"
+
+
+async def test_an_oauth_caller_is_refused_before_spending_anything(fake_db):
+    """And the refusal costs them nothing. It used to be raised at the upstream
+    hop, i.e. after the cap counter had already spent a call — and after
+    `fire_sandbox` had spent one of its TEN LIFETIME fires and really posted to
+    the sandbox endpoint."""
+    import gating as g
+    from mcp_client import MCPSession, app_client
+
+    if not g.oauth_enabled():
+        pytest.skip("OAuth signing not configured in this harness")
+    minted = g.issue_access_token("harness", TENANT_A_KEY)
+    async with app_client() as client:
+        s = MCPSession(client, minted["access_token"])
+        await s.initialize()
+        for _ in range(5):
+            assert not (await s.call("get_coverage", {}))["ok"]
+        assert not (await s.call("fire_sandbox", ARGS["fire_sandbox"]))["ok"]
+    assert not [1 for n, _ in fake_db.rpcs if n == "increment_mcp_usage"], (
+        "a refused OAuth call incremented a counter")
+
+
+def test_the_raw_key_is_not_in_the_caller_identity_repr():
+    """A frozen dataclass's generated repr would print the live customer
+    credential. Nothing prints it today; that is one error reporter away from
+    being untrue."""
+    import gating as g
+
+    c = g.CallerIdentity(key_id=TENANT_A_KEY_ID, user_id="u", entitlement="pro",
+                         via="key", upstream_key=TENANT_A_KEY)
+    for rendered in (repr(c), str(c), f"{c}", "{}".format(c)):
+        assert TENANT_A_KEY not in rendered, f"the key appears in {rendered!r}"
+    assert c.upstream_key == TENANT_A_KEY, "the field itself must still work"
+
+
+def test_an_unnamed_auth_method_does_not_inherit_key_passthrough():
+    """`bind_caller` used to default an unknown `via` to "key", which would have
+    forwarded whatever string a future auth path presented as a bearer."""
+    import gating as g
+
+    for info in ({"key_id": "k", "user_id": "u"},
+                 {"key_id": "k", "user_id": "u", "via": ""},
+                 {"key_id": "k", "user_id": "u", "via": "cookie"},
+                 {"key_id": "k", "user_id": "u", "via": "KEY "}):
+        reset = g.bind_caller(info, "something-the-caller-sent")
+        try:
+            if (info.get("via") or "").strip().lower() == "key":
+                continue
+            assert g.current_caller().upstream_key is None, info
+            with pytest.raises(g.TenantContextUnavailable):
+                mcp_server._headers()
+        finally:
+            g.release_caller(reset)
 
 
 async def test_the_caller_key_id_is_not_a_credential_the_caller_chooses(upstream):

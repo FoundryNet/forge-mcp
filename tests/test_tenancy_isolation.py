@@ -30,7 +30,8 @@ from identities import (
 )
 from mcp_client import session
 
-pytestmark = pytest.mark.asyncio
+# asyncio_mode = auto in pytest.ini marks the async tests; an explicit module
+# mark also lands on the sync ones and emits a warning per test.
 
 # Tools that take NO machine/tenant argument and therefore return whatever the
 # upstream identity's whole account holds. These are the blast radius.
