@@ -1,0 +1,74 @@
+# gitleaks configuration for FoundryNet private repositories.
+#
+# GitHub push protection is unavailable on these repos: secret scanning for
+# private repositories requires GitHub Advanced Security, which this account does
+# not have. The public repos have it enabled; the private ones need their own
+# guard, and this is it.
+#
+# Tuned against real incidents. A 2026-09-27 scan of all 55 FoundryNet
+# repositories found Supabase service-role keys, Postgres passwords and a machine
+# keypair committed across 11 public repos. The rules below are the shapes that
+# actually leaked, in addition to the upstream defaults.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "supabase-service-role-jwt"
+description = "Supabase service_role JWT — bypasses row-level security entirely"
+regex = '''eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]*(?:c2VydmljZV9yb2xl|role"\s*:\s*"service_role)[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{10,}'''
+keywords = ["eyJ", "service_role"]
+
+[[rules]]
+id = "supabase-any-jwt"
+description = "Any Supabase JWT (anon keys are public by design; flag for review)"
+regex = '''eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{20,}'''
+keywords = ["eyJ"]
+
+[[rules]]
+id = "supabase-management-token"
+description = "Supabase Management API token (sbp_)"
+regex = '''sbp_[a-f0-9]{40}'''
+keywords = ["sbp_"]
+
+[[rules]]
+id = "postgres-url-with-password"
+description = "Postgres connection string with an inline password"
+regex = '''postgres(?:ql)?://[^:\s'"]+:[^@\s'"]{8,}@[^\s'"]+'''
+keywords = ["postgres://", "postgresql://"]
+
+[[rules]]
+id = "neon-password"
+description = "Neon Postgres password (npg_)"
+regex = '''npg_[A-Za-z0-9]{10,}'''
+keywords = ["npg_"]
+
+[[rules]]
+id = "foundry-machine-keypair"
+description = "Forge/MINT machine keypair or credentials file contents"
+regex = '''"(?:private_key|secret_key|machine_key|keypair)"\s*:\s*"[A-Za-z0-9+/=_-]{40,}"'''
+keywords = ["private_key", "keypair", "machine_key"]
+
+[[rules]]
+id = "railway-token"
+description = "Railway API token"
+regex = '''(?i)railway[_-]?(?:api[_-]?)?token['"\s:=]+([A-Za-z0-9-]{24,})'''
+keywords = ["railway"]
+
+[allowlist]
+description = "Fixtures, prose and vendored third-party content"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)vendor/''',
+  '''(^|/)tests?/fixtures/''',
+  '''\.lock$''',
+  '''(^|/)requirements-runtime\.lock$''',
+]
+regexes = [
+  # Literal test fixtures used to prove a guard REFUSES a live key.
+  '''sk_live_abc123''',
+  '''sk_live_\*''',
+  # Prose in docstrings and reports that names a pattern without carrying one.
+  '''`sk_live_''',
+  '''sk_live_[*.]''',
+]
