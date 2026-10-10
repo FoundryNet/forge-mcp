@@ -79,10 +79,16 @@ OUT = os.path.join(HERE, "build_info.json")
 
 # Mirrors .gitignore / what the uploader skips. See THE FILE SET above.
 SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules",
-             ".pytest_cache", ".mypy_cache", "migrations"}
+             ".pytest_cache", ".mypy_cache", ".benchmarks", "migrations"}
 SKIP_SUFFIX = (".pyc", ".pyo", ".log", ".key", ".tar", ".tar.gz")
 SKIP_CONTAINS = (".bak.", ".backup")
-SKIP_NAMES = {"build_info.json"}          # never hash the stamp into itself
+# `build_info.json` is never hashed into itself. The two CI artefacts are
+# written INTO the workspace by release-gate.yml, so on a runner -- or on a
+# laptop that has just run the suite -- they would otherwise join the hash and
+# make two identical trees report different content_hashes. Both are excluded
+# from the upload as well; .railwayignore and this set have to agree, which
+# tests/test_the_build_stamp_actually_ships.py asserts.
+SKIP_NAMES = {"build_info.json", "junit.xml", "pytest.out"}
 
 
 def _git(*a):
