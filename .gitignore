@@ -13,3 +13,12 @@ migrations/
 .env
 *.key
 .venv/
+
+# build stamp — written by stamp_build.py at deploy/boot, never committed.
+# Committing it would make the hash depend on the previous hash and would make
+# every tree permanently dirty by one file.
+build_info.json
+
+# CI step artefacts (release-gate.yml writes these into the workspace)
+junit.xml
+pytest.out
