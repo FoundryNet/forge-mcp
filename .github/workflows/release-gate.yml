@@ -230,6 +230,7 @@ jobs:
             tests/test_rest_mcp_parity.py
             tests/test_smoke_transport.py
             tests/test_tenancy_isolation.py
+            tests/test_the_build_stamp_actually_ships.py
             tests/test_tool_surface.py
             # SUITE-END
           )
