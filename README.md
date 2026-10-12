@@ -1,8 +1,8 @@
 # Forge by Foundry Labs — Industrial Machine Intelligence
 
 The cross-manufacturer industrial MCP server. Talk to any CNC, robot, or industrial
-machine in natural language — machine identity, telemetry normalization across 45
-vendor packs in 19 verticals, plain-English automation, and tamper-evident work records.
+machine in natural language — machine identity, telemetry normalization across 46
+vendor packs in 20 verticals, plain-English automation, and tamper-evident work records.
 
 Hosted MCP over Streamable HTTP. 32 tools wrap the Forge v1 API: provision a stable machine
 identity, normalize raw OEM telemetry into a canonical schema, query operational history,
