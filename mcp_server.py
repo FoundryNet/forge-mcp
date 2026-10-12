@@ -1492,7 +1492,7 @@ async def server_card(request: Request) -> JSONResponse:
             "name":      "FoundryNet Forge",
             "tagline":   "Plain English in. Autonomous action out.",
             "description": (
-                "Watch any signal across 45 vendor packs in 19 verticals — Fanuc, Siemens, "
+                "Watch any signal across 46 vendor packs in 20 verticals — Fanuc, Siemens, "
                 "Haas, DMG Mori, Mazak, Okuma, Doosan, Makino, ABB, KUKA, "
                 "Universal Robots, Yaskawa, Stäubli, Trumpf, Bystronic, "
                 "Bosch Rexroth — backed by a corpus of 16,908 confirmed field "
@@ -1555,7 +1555,7 @@ async def server_card(request: Request) -> JSONResponse:
                 {"name": "identify_machine",
                  "description": "Provision a stable machine identity (mint_id) for an OEM/model/serial machine. Idempotent."},
                 {"name": "normalize_telemetry",
-                 "description": "Give an agent semantic understanding of machine data from any OEM: translate raw vendor telemetry into canonical FCS fields across 45 vendor packs in 19 verticals, from a corpus of 16,908 confirmed field mappings."},
+                 "description": "Give an agent semantic understanding of machine data from any OEM: translate raw vendor telemetry into canonical FCS fields across 46 vendor packs in 20 verticals, from a corpus of 16,908 confirmed field mappings."},
                 {"name": "query_machine_history",
                  "description": "Read normalized operational history for a machine with field projection, time-range filters, and summary mode."},
                 {"name": "create_automation",
@@ -1674,7 +1674,7 @@ async def wellknown_mcp_json(request: Request) -> JSONResponse:
         "short_name": "foundrynet-forge",
         "description": ("Industrial AI infrastructure. MCP tools for cross-OEM "
                         "equipment normalization, prediction, and governance. "
-                        "45 vendor packs across 19 verticals, 366 canonical fields."),
+                        "46 vendor packs across 20 verticals, 366 canonical fields."),
         "version": "3.4.4",
         "url": endpoint,
         "endpoint": endpoint,
@@ -1701,8 +1701,8 @@ async def wellknown_agent_card(request: Request) -> JSONResponse:
     return JSONResponse({
         "name": "Forge by Foundry Labs",
         "description": ("Cross-OEM industrial telemetry normalization, runtime kernel, "
-                        "and machine identity for industrial equipment. 45 vendor packs "
-                        "across 19 verticals, 366 canonical fields."),
+                        "and machine identity for industrial equipment. 46 vendor packs "
+                        "across 20 verticals, 366 canonical fields."),
         "url": "https://mcp.foundrynet.io/mcp",
         "version": "3.4.4",
         "capabilities": {"tools": ["normalize", "identify", "query_corpus",
@@ -1853,7 +1853,7 @@ async def wellknown_a2a_agent_json(request: "Request") -> JSONResponse:
         "skills": [
             {"id": "normalize_telemetry", "name": "Normalize Equipment Telemetry",
              "description": ("Translate raw machine data from any OEM into a universal "
-                             "schema. 12 payload-decoding protocols, 45 vendor packs."),
+                             "schema. 12 payload-decoding protocols, 46 vendor packs."),
              "tags": ["industrial", "iot", "normalization", "manufacturing"],
              "examples": ["Normalize Fanuc CNC spindle data",
                           "Translate Siemens PLC readings to universal schema",
