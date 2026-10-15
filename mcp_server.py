@@ -607,10 +607,40 @@ async def check_guardrail(machine_id: str, proposed: dict,
     """Test whether a proposed action would be blocked, WITHOUT attempting it.
 
     `proposed` is a dict of canonical field -> value you are considering, e.g.
-    {"spindle_speed_rpm": 13000}. Returns:
-      {"would_block": true, "guardrail": "Spindle overspeed protection",
-       "reason": "spindle_speed_rpm 13000 > limit 12000", "violations": [...]}
-    or {"would_block": false, ...} when nothing is violated.
+    {"spindle_speed_rpm": 13000}.
+
+    TWO LAYERS ANSWER, AND ONLY ONE OF THEM ALWAYS EXISTS.
+
+      1. Registry-wide PHYSICAL BOUNDS. Always checked, nothing to configure.
+         These are possibility envelopes for the canonical field, not limits for
+         your machine: spindle_speed_rpm is declared [-50000, 50000] for every
+         machine in the fleet.
+      2. Per-machine GUARDRAILS written by an engineer. These carry the real
+         operating limits — and they are OPT-IN. A machine nobody has authored
+         rules for has NONE, and `list_guardrails` returns {"count": 0}.
+
+    So on a freshly provisioned machine:
+
+      check_guardrail(mid, {"spindle_speed_rpm": 13000})
+        -> {"would_block": false, "guardrail": null, "reason": null,
+            "violations": [], "guardrails_evaluated": 0,
+            "declared_bounds": {"spindle_speed_rpm": [-50000.0, 50000.0]},
+            "physical_bounds_checked": true}
+
+    `would_block: false` with `guardrails_evaluated: 0` does NOT mean 13000 rpm
+    is safe for that spindle — it means nobody has told Forge what the spindle's
+    limit is, and 13000 is not physically impossible. DO NOT read it as
+    permission. Check `guardrails_evaluated`; if it is 0, say so to the user
+    rather than acting on the absence of a rule.
+
+    Once a rule exists the shape is what you would expect:
+
+      -> {"would_block": true, "guardrail": "Spindle overspeed protection",
+          "reason": "spindle_speed_rpm 13000 > limit 12000", "violations": [...]}
+
+    A field that resolves to no canonical at all is REFUSED, not passed:
+    `unresolvable_fields` is returned and the action is blocked, because an
+    unplaceable field cannot be range-checked.
 
     This is a dry run: it writes nothing and is not recorded as a blocked
     attempt. Call it BEFORE acting so you can self-correct to a safe value
@@ -619,7 +649,8 @@ async def check_guardrail(machine_id: str, proposed: dict,
     administrator must change the guardrail.
 
     USE WHEN: you are about to recommend or set a value on a machine and want
-    to confirm it is inside the safe envelope."""
+    to confirm it is inside the safe envelope — and to find out whether an
+    envelope has been declared at all."""
     body: dict = {"machine_id": machine_id, "proposed": proposed}
     if agent_id:
         body["agent_id"] = agent_id
@@ -924,15 +955,38 @@ async def correct_mapping(
 
 @mcp.tool
 async def get_coverage(oem: Optional[str] = None) -> dict:
-    """Ask Forge what it can normalize BEFORE you try: the recognized OEM
-    verticals (CNC / robot / vehicle / AMR), the canonical-field families, and
-    the field list per family. Optionally pass an `oem` to see which vertical it
-    resolves to and whether the cross-vertical gate will engage.
+    """Ask Forge what it can normalize BEFORE you try.
+
+    Returns, straight from the kernel so this description cannot go stale:
+
+      vertical_oems                   every OEM string that routes to a
+                                      vertical, grouped by the vertical it
+                                      actually resolves to
+      verticals_without_oem_routing   verticals that ship vendor packs but have
+                                      no OEM string to pass, so the
+                                      cross-vertical gate cannot engage for them
+      canonical_families              the canonical-field families and the field
+                                      list per family
+      canonical_field_count           fields in the registry
+      vertical_packs                  packs loaded, mappings, and every vertical
+
+    READ THE RESPONSE, DO NOT TRUST A LIST IN THIS DESCRIPTION. This docstring
+    used to name "CNC / robot / vehicle / AMR" as the recognized verticals —
+    four of twenty. An agent that believed it would have concluded Forge does
+    not handle solar, energy, geothermal, water, mining, pharma, HVAC or data
+    centre assets, all of which ship packs, and the energy vertical is fully
+    gated with 30+ working OEM strings.
+
+    Optionally pass an `oem` to resolve it: the reply gives `vertical` and
+    whether `vertical_gate` is active. Unknown OEMs still normalize (the gate
+    disables itself), so absence is a soft signal, not a hard block — but it is
+    not a free one: with no gate, candidate canonicals from every other vertical
+    compete on cosine alone, which is how a geothermal brine inlet temperature
+    reached for `vehicle.air_inlet_temp`.
 
     USE WHEN: starting a new integration, or deciding whether to call
-    normalize_telemetry — confirm the machine's OEM and your fields are in
-    coverage. Unknown OEMs still normalize (the gate just disables itself), so
-    absence here is a soft signal, not a hard block.
+    normalize_telemetry — confirm the machine's OEM resolves and your fields
+    are in coverage.
     """
     params = {"oem": oem} if oem else None
     return await _call_forge("GET", "/v1/coverage", params=params)
@@ -1583,7 +1637,7 @@ async def server_card(request: Request) -> JSONResponse:
                 {"name": "correct_mapping",
                  "description": "FREE: teach Forge the right canonical field when normalize_telemetry mapped a column wrong or abstained. Each correction is a corpus-improvement signal feeding an offline retrain."},
                 {"name": "get_coverage",
-                 "description": "FREE: schema introspection — recognized OEM verticals (CNC/robot/vehicle/AMR) and canonical-field families, so an agent can check coverage before calling normalize_telemetry."},
+                 "description": "FREE: schema introspection — every OEM string that routes to a vertical (grouped by where it resolves), the verticals that ship packs with no OEM routing, and the canonical-field families, so an agent can check coverage before calling normalize_telemetry."},
                 {"name": "predict",
                  "description": "PREMIUM: forecast the next N readings of a canonical telemetry series via TimesFM — point forecast plus quantile uncertainty bands, no per-machine training."},
                 {"name": "predict_breach",
