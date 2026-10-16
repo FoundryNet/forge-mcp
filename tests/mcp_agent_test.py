@@ -152,6 +152,29 @@ def _require_forge_core() -> pathlib.Path:
 
 FORGE_CORE_ROOT = _require_forge_core()
 
+
+def _forge_core_revision() -> str:
+    """Which forge-prod produced this report.
+
+    Layer 2's answers come from a SEPARATE repo, so a result here is only
+    meaningful alongside the commit it was measured against -- `sunspec` routes
+    to `energy` or to nothing depending on whether that checkout carries the
+    pack-route derivation, and both are correct answers about different code.
+    A snapshot that does not name its forge_core cannot be told from a stale one.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(FORGE_CORE_ROOT), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10)
+        rev = (out.stdout or "").strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(FORGE_CORE_ROOT), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        return f"{rev}{'-dirty' if dirty else ''}" if rev else "unknown"
+    except Exception:
+        return "unknown"
+
 from forge_core import field_registry as _registry          # noqa: E402
 from forge_core.guardrails import _declared_bounds          # noqa: E402
 from forge_core.guards import (                             # noqa: E402
@@ -707,14 +730,22 @@ async def test_cross_domain_inference(forge):
     **robot**, `solaredge` to **energy** - so the premise holds and the
     namespace does the work.
 
-    It also surfaced something sharper, recorded here as a finding rather than
-    asserted away: A PACK SCOPE NAME IS NOT AN OEM ROUTING NAME. `sunspec`,
-    `sunspec_storage`, `abb_robot` and `haas_ngc` all resolve TAGS from their
-    packs, and all four route to `vertical: null`, so the cross-vertical gate
-    disables for exactly the strings an integrator is most likely to type -
-    the name of the standard their device speaks. `solaredge` and `haas` route
-    fine. This is the same shape as the geothermal integrator who guessed four
-    vendor names and got `vertical: null` for all four.
+    It also surfaced something sharper: A PACK SCOPE NAME IS NOT AN OEM ROUTING
+    NAME. `sunspec`, `sunspec_storage`, `abb_robot` and `haas_ngc` all resolve
+    TAGS from their packs, and all four routed to `vertical: null`, so the
+    cross-vertical gate disabled for exactly the strings an integrator is most
+    likely to type - the name of the standard their device speaks. `solaredge`
+    and `haas` routed fine. Same shape as the geothermal integrator who guessed
+    four vendor names and got `vertical: null` for all four.
+
+    THIS TEST DOES NOT PIN THAT DEFECT. forge-prod's fix derives routing from
+    what the packs declare (`guards._pack_route_map`), so those four are
+    expected to route once it lands - and a harness that asserted `is None`
+    would then fail on the repo that fixed it, which is backwards. The scopes
+    are therefore RECORDED with whatever they resolve to, and what is asserted
+    is the invariant that holds either way: a scope that routes must route to a
+    real vertical with the gate ACTIVE, and one that does not must say so
+    explicitly rather than guess.
     """
     routes_to = {
         "siemens": "cnc",
@@ -724,14 +755,14 @@ async def test_cross_domain_inference(forge):
         "kuka": "robot",
         "prusa": "printer",
     }
-    # Resolve tags but route to no vertical - the gate is off for these.
-    resolves_but_unrouted = ["sunspec", "sunspec_storage", "abb_robot",
-                             "haas_ngc"]
+    # Pack SCOPE names. These resolve tags from their own packs; whether they
+    # also ROUTE depends on which forge-prod this runs against.
+    pack_scope_names = ["sunspec", "sunspec_storage", "abb_robot", "haas_ngc"]
     unknown = "definitely_not_a_real_oem"
 
     observed = {}
     async with session(TENANT_A_KEY) as s:
-        for oem in list(routes_to) + resolves_but_unrouted + [unknown]:
+        for oem in list(routes_to) + pack_scope_names + [unknown]:
             out = await s.call("get_coverage", {"oem": oem})
             assert out["ok"], (oem, out.get("error"))
             observed[oem] = out["payload"]["resolved_oem"]
@@ -743,16 +774,23 @@ async def test_cross_domain_inference(forge):
         "the cross-domain premise failed: siemens and solaredge resolved the "
         "same vertical")
 
-    unrouted = {}
-    for oem in resolves_but_unrouted:
-        assert observed[oem]["vertical"] is None, (oem, observed[oem])
-        assert "inactive" in observed[oem]["vertical_gate"]
-        unrouted[oem] = {
-            "vertical": None,
-            "pack_tags_do_resolve": bool(
-                [t for t in ("W", "ChaState", "axis1_angle", "spd_rpm")
-                 if deterministic_lookup(t, oem)]),
-        }
+    scope_routing = {}
+    for oem in pack_scope_names:
+        vertical = observed[oem]["vertical"]
+        gate = observed[oem]["vertical_gate"]
+        resolves = bool([t for t in ("W", "ChaState", "axis1_angle", "spd_rpm")
+                         if deterministic_lookup(t, oem)])
+        assert resolves, (
+            f"{oem} resolves no pack tag, so it is not a pack scope and this "
+            f"probe is measuring nothing")
+        if vertical is None:
+            assert "inactive" in gate, (oem, observed[oem])
+        else:
+            assert gate == "active", (oem, observed[oem])
+            assert vertical in {"cnc", "robot", "vehicle", "amr", "printer",
+                                "energy", "geothermal"}, (oem, vertical)
+        scope_routing[oem] = {"vertical": vertical, "gate": gate,
+                              "pack_tags_do_resolve": resolves}
 
     assert observed[unknown]["vertical"] is None
     assert "inactive" in observed[unknown]["vertical_gate"]
@@ -760,17 +798,18 @@ async def test_cross_domain_inference(forge):
     REC.record(
         layer="1-mcp", scenario="cross-domain", kind="get_coverage",
         request={"routed_probes": sorted(routes_to),
-                 "unrouted_probes": resolves_but_unrouted,
+                 "pack_scope_probes": pack_scope_names,
                  "unknown_probe": unknown},
         response={"resolved": observed,
-                  "pack_scope_not_a_routing_name": unrouted},
+                  "pack_scope_routing": scope_routing},
         assertion=("each OEM resolves to its own vertical with the gate ACTIVE "
                    "(siemens->cnc, solaredge->energy, caterpillar->vehicle, "
                    "kuka->robot, prusa->printer); an unrecognized OEM returns "
                    "vertical:null and an explicitly inactive gate rather than "
-                   "a guess. FINDING: four pack SCOPE names resolve tags but "
-                   "route to no vertical, so the gate is off for the string an "
-                   "integrator is most likely to pass."),
+                   "a guess. The four pack SCOPE names are recorded with "
+                   "whatever they resolve to: null with an inactive gate on a "
+                   "forge-prod without the pack-route derivation, their pack's "
+                   "own vertical with an ACTIVE gate once it lands."),
         outcome="finding")
 
 
@@ -1275,6 +1314,7 @@ def _write_report(session_obj) -> None:
         },
         "environment": {
             "forge_core_root": str(FORGE_CORE_ROOT),
+            "forge_core_revision": _forge_core_revision(),
             "forge_base_url": os.environ.get("FORGE_BASE_URL"),
             "prod_contacted": False,
             "credentials_used": None,
@@ -1305,6 +1345,8 @@ def _write_report(session_obj) -> None:
     print(f"  collected        {collected}")
     print(f"  failed           {failed}")
     print(f"  observations     {len(REC.interactions)}  {by_layer}")
+    print(f"  forge_core       {report['environment']['forge_core_revision']} "
+          f"({report['environment']['forge_core_root']})")
     print(f"  registry         {report['environment']['registry_field_count']} fields "
           f"(v{report['environment']['registry_version']})")
     print(f"  packs            {ps.get('packs_loaded')} packs / "

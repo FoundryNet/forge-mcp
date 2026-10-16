@@ -1,14 +1,15 @@
 {
   "harness": "tests/mcp_agent_test.py",
-  "generated_at": "2026-10-16T18:09:25Z",
-  "duration_s": 173.04,
+  "generated_at": "2026-10-16T18:42:52Z",
+  "duration_s": 2.81,
   "run": {
-    "tests_collected": 268,
+    "tests_collected": 27,
     "tests_failed": 0,
     "verdict": "PASS"
   },
   "environment": {
-    "forge_core_root": "/Users/ryangordon/forge-prod",
+    "forge_core_root": "/private/tmp/claude-501/-Users-ryangordon-Desktop-worklog1/23fc9ed4-80e2-4373-830b-d1ea2c7e1979/scratchpad/fp-main",
+    "forge_core_revision": "a14857b",
     "forge_base_url": "https://forge.test.invalid",
     "prod_contacted": false,
     "credentials_used": null,
@@ -122,7 +123,7 @@
           "siemens",
           "solaredge"
         ],
-        "unrouted_probes": [
+        "pack_scope_probes": [
           "sunspec",
           "sunspec_storage",
           "abb_robot",
@@ -188,26 +189,30 @@
             "vertical_gate": "inactive - OEM unrecognized, gate disabled (normalize still works)"
           }
         },
-        "pack_scope_not_a_routing_name": {
+        "pack_scope_routing": {
           "sunspec": {
             "vertical": null,
+            "gate": "inactive - OEM unrecognized, gate disabled (normalize still works)",
             "pack_tags_do_resolve": true
           },
           "sunspec_storage": {
             "vertical": null,
+            "gate": "inactive - OEM unrecognized, gate disabled (normalize still works)",
             "pack_tags_do_resolve": true
           },
           "abb_robot": {
             "vertical": null,
+            "gate": "inactive - OEM unrecognized, gate disabled (normalize still works)",
             "pack_tags_do_resolve": true
           },
           "haas_ngc": {
             "vertical": null,
+            "gate": "inactive - OEM unrecognized, gate disabled (normalize still works)",
             "pack_tags_do_resolve": true
           }
         }
       },
-      "assertion": "each OEM resolves to its own vertical with the gate ACTIVE (siemens->cnc, solaredge->energy, caterpillar->vehicle, kuka->robot, prusa->printer); an unrecognized OEM returns vertical:null and an explicitly inactive gate rather than a guess. FINDING: four pack SCOPE names resolve tags but route to no vertical, so the gate is off for the string an integrator is most likely to pass.",
+      "assertion": "each OEM resolves to its own vertical with the gate ACTIVE (siemens->cnc, solaredge->energy, caterpillar->vehicle, kuka->robot, prusa->printer); an unrecognized OEM returns vertical:null and an explicitly inactive gate rather than a guess. The four pack SCOPE names are recorded with whatever they resolve to: null with an inactive gate on a forge-prod without the pack-route derivation, their pack's own vertical with an ACTIVE gate once it lands.",
       "outcome": "finding"
     },
     {
@@ -776,7 +781,7 @@
           "siemens",
           "solaredge"
         ],
-        "unrouted_probes": [
+        "pack_scope_probes": [
           "sunspec",
           "sunspec_storage",
           "abb_robot",
@@ -842,26 +847,30 @@
             "vertical_gate": "inactive - OEM unrecognized, gate disabled (normalize still works)"
           }
         },
-        "pack_scope_not_a_routing_name": {
+        "pack_scope_routing": {
           "sunspec": {
             "vertical": null,
+            "gate": "inactive - OEM unrecognized, gate disabled (normalize still works)",
             "pack_tags_do_resolve": true
           },
           "sunspec_storage": {
             "vertical": null,
+            "gate": "inactive - OEM unrecognized, gate disabled (normalize still works)",
             "pack_tags_do_resolve": true
           },
           "abb_robot": {
             "vertical": null,
+            "gate": "inactive - OEM unrecognized, gate disabled (normalize still works)",
             "pack_tags_do_resolve": true
           },
           "haas_ngc": {
             "vertical": null,
+            "gate": "inactive - OEM unrecognized, gate disabled (normalize still works)",
             "pack_tags_do_resolve": true
           }
         }
       },
-      "assertion": "each OEM resolves to its own vertical with the gate ACTIVE (siemens->cnc, solaredge->energy, caterpillar->vehicle, kuka->robot, prusa->printer); an unrecognized OEM returns vertical:null and an explicitly inactive gate rather than a guess. FINDING: four pack SCOPE names resolve tags but route to no vertical, so the gate is off for the string an integrator is most likely to pass.",
+      "assertion": "each OEM resolves to its own vertical with the gate ACTIVE (siemens->cnc, solaredge->energy, caterpillar->vehicle, kuka->robot, prusa->printer); an unrecognized OEM returns vertical:null and an explicitly inactive gate rather than a guess. The four pack SCOPE names are recorded with whatever they resolve to: null with an inactive gate on a forge-prod without the pack-route derivation, their pack's own vertical with an ACTIVE gate once it lands.",
       "outcome": "finding"
     },
     {

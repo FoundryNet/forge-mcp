@@ -279,19 +279,21 @@ rather than a guess — normalize still runs, but the cross-vertical gate cannot
 engage, so candidates from every vertical compete on cosine alone. That is how
 a geothermal brine inlet temperature once reached for `vehicle.air_inlet_temp`.
 
-### Finding to disclose, not hide
+### Check which forge-prod you are demoing against
 
-**A pack SCOPE name is not an OEM ROUTING name.** These four resolve tags from
-their packs and route to `vertical: null`:
+**A pack SCOPE name used not to be an OEM ROUTING name.** `sunspec`,
+`sunspec_storage`, `abb_robot` and `haas_ngc` resolved tags from their packs
+and routed to `vertical: null`, so the gate disabled for exactly the strings an
+integrator is most likely to type — the name of the standard their device
+speaks — while `solaredge` and `haas` routed fine.
 
-```
-sunspec, sunspec_storage, abb_robot, haas_ngc
-```
+Fixed by deriving routing from what the packs declare: all four now route, with
+154 other scopes, taking routed OEM strings from 124 to 282.
 
-`solaredge` and `haas` route fine. So the gate disables for exactly the strings
-an integrator is most likely to type — the name of the standard their device
-speaks. Same shape as the geothermal integrator who guessed four vendor names
-and got `vertical: null` for all four. Recorded as a finding in the report.
+**Before demoing, read `environment.forge_core_revision` in the results JSON
+and check `get_coverage(oem="sunspec")` live.** If it answers `vertical: null`,
+you are on a forge-prod without the fix — say so rather than narrating the
+fixed behaviour over the old one.
 
 ---
 

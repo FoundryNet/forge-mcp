@@ -102,10 +102,18 @@ OEM strings; 12 pack verticals have no routing at all (`chemical`,
 `logistics`, `mining`, `pharma`, `pump`, `ups`, `water`), which `/v1/coverage`
 does say out loud under `verticals_without_oem_routing`.
 
-**Not fixed here** — adding routing aliases is a forge-prod change to
-`_machine_vertical`'s table, and whether a standard name *should* route to a
-vertical is a product decision (a `sunspec` device is energy; an `abb_robot`
-is a robot — both look mechanical). Recorded as a finding.
+**Fixed in forge-prod, not here** — `guards._pack_route_map()` now derives
+routing from what the packs declare, so all four route (`sunspec` and
+`sunspec_storage` → energy, `abb_robot` → robot, `haas_ngc` → cnc) along with
+154 other scopes. Routed OEM strings went 124 → 282.
+
+`test_cross_domain_inference` deliberately does **not** pin the defect: it
+records whatever those scopes resolve to and asserts only the invariant that
+holds either way — a scope that routes must route to a real vertical with the
+gate ACTIVE, one that does not must say so explicitly. Verified green against
+both forge-prod `a14857b` (unrouted) and the fix (routed). The results JSON
+carries `environment.forge_core_revision`, so a snapshot can be told from a
+stale one.
 
 ### 3. Mapping guards do not apply to the pack layer, and that is worth 254 rows
 
