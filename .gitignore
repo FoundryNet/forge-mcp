@@ -19,6 +19,13 @@ migrations/
 # every tree permanently dirty by one file.
 build_info.json
 
+# agent-harness report - written by tests/mcp_agent_test.py on every run, never
+# committed. It records the machine's own scratchpad paths, the forge_core
+# revision it ran against and a fresh timestamp, so a committed copy is stale
+# the moment anyone re-runs the harness. docs/mcp_demo_sequence.md already says
+# to re-run the harness and re-read the report before quoting it.
+tests/mcp_agent_results.json
+
 # CI step artefacts (release-gate.yml writes these into the workspace)
 junit.xml
 pytest.out
