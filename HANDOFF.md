@@ -16,10 +16,14 @@ release gate and a wrong archive root, stamps before uploading, passes
 `content_hash` match the stamp. A deploy here IS verifiable; use the script.
 The claim had also reached the global CLAUDE.md, which is corrected too.
 
-**What is true: prod is BEHIND main.** On 2026-10-16 `/health` served `96f2b86`
-(2026-10-09) while `main` was `98b6357` — #9 and #10 are merged and NOT
-deployed, so #9's tool-description corrections are not live. Not deployed this
-session: the owner asked for read-only validation. Check `/health` before
+**That gap is CLOSED. Deployed 2026-10-17T01:00Z.** `/health` serves
+`3269283`, `content_hash=sha256:3b87ff90fbe96716ada…`, `status=ok`, 32 tools,
+36 files — verified by `deploy.sh`'s own poll and again by hand afterwards. It
+had been serving `96f2b86` since 2026-10-09, so #9's tool-description
+corrections and #10's harness are live for the first time. The local release
+gate ran on the uploaded bytes before the upload: clean tree, deps in their
+pins, imports with no env, 268/268 behavioural, version 3.4.4 agreeing across
+`mcp_server.py` and `server.json`. Check `/health` before
 assuming any merge here is serving.
 
 ---
