@@ -3,10 +3,24 @@
 Repo: `github.com/FoundryNet/forge-mcp` · Railway service `162115b7-b420-4a02-8cff-ddad7be02dc2`
 (`foundrynet-mcp`) · public endpoint `mcp.foundrynet.io/mcp` (Streamable HTTP, 32 tools, v3.4.4).
 
-Deploy: `cd ~/forge-mcp && git pull --ff-only && railway up --service 162115b7-b420-4a02-8cff-ddad7be02dc2`
-— **`--service` is not optional**; this repo has no deploy script and no build
-stamp, so nothing can prove afterwards which commit is serving. Treat a deploy
-here as unverified until that exists.
+Deploy: **`cd ~/forge-mcp && git fetch origin && git checkout main && git pull --ff-only && ./deploy.sh`**
+
+**⚠ CORRECTED 2026-10-16.** The line above used to read `railway up --service
+162115b7-…` with the note "this repo has no deploy script and no build stamp, so
+nothing can prove afterwards which commit is serving". **Both halves were false
+when written.** `deploy.sh` and `stamp_build.py` landed on 2026-10-09 in #5 and
+#7; the stamp is live on `mcp.foundrynet.io/health` under the same key names
+forge-prod uses, and the script refuses a dirty tree, the wrong branch, a red
+release gate and a wrong archive root, stamps before uploading, passes
+`--service` explicitly, then polls `/health` until `commit_short` AND
+`content_hash` match the stamp. A deploy here IS verifiable; use the script.
+The claim had also reached the global CLAUDE.md, which is corrected too.
+
+**What is true: prod is BEHIND main.** On 2026-10-16 `/health` served `96f2b86`
+(2026-10-09) while `main` was `98b6357` — #9 and #10 are merged and NOT
+deployed, so #9's tool-description corrections are not live. Not deployed this
+session: the owner asked for read-only validation. Check `/health` before
+assuming any merge here is serving.
 
 ---
 
