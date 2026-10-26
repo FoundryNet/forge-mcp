@@ -2173,13 +2173,24 @@ def build_dual_app():
     # applied for edge-consistency.
     import hmac as _hmac
     from starlette.middleware.base import BaseHTTPMiddleware
-    _secret = os.environ.get("ORIGIN_SHARED_SECRET", "").strip()
+    # A comma-separated list is accepted so a rotation has no window in which
+    # Cloudflare and this origin disagree: "new,old", switch the Transform Rule,
+    # then "new". A single value behaves exactly as before. Same rule as
+    # forge-prod's guard (2026-10-26).
+    _secrets = tuple(s.strip() for s in
+                     os.environ.get("ORIGIN_SHARED_SECRET", "").split(",") if s.strip())
+
+    def _origin_key_ok(presented):
+        ok = False
+        for s in _secrets:              # no early exit: timing hides which slot matched
+            ok |= _hmac.compare_digest(presented, s)
+        return ok
 
     class _OriginGuard(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
-            if _secret and not request.url.path.startswith("/health"):
+            if _secrets and not request.url.path.startswith("/health"):
                 presented = (request.headers.get("x-forge-origin-key") or "").strip()
-                if not (presented and _hmac.compare_digest(presented, _secret)):
+                if not (presented and _origin_key_ok(presented)):
                     return JSONResponse({"error": "bad_request"}, status_code=400)
             return await call_next(request)
 

@@ -227,6 +227,7 @@ jobs:
             tests/test_cost_ledger_single_writer.py
             tests/test_deploy_verifies_what_it_shipped.py
             tests/test_idempotency.py
+            tests/test_origin_secret_rotation.py
             tests/test_rest_mcp_parity.py
             tests/test_smoke_transport.py
             tests/test_tenancy_isolation.py
