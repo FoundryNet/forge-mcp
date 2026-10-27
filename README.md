@@ -1,4 +1,4 @@
-# Forge by Foundry Labs — Industrial Machine Intelligence
+# Forge by FoundryNet — Industrial Machine Intelligence
 
 The cross-manufacturer industrial MCP server. Talk to any CNC, robot, or industrial
 machine in natural language — machine identity, telemetry normalization across 46

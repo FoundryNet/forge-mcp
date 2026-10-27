@@ -588,7 +588,7 @@ def _err(payload: dict) -> ToolError:
 def _err_no_auth() -> ToolError:
     return _err({
         "error":      "missing_api_key",
-        "message":    f"Authorization: Bearer fnet_… required. Sign up free at {SIGNUP_URL}",
+        "message":    f"Authorization: Bearer <api_key> required. Sign up free at {SIGNUP_URL}",
         "signup_url": SIGNUP_URL,
     })
 

@@ -2,7 +2,7 @@
 # Scope stays @foundrynet/forge so Smithery RE-INDEXES the existing listing
 # (do not rename the scope — that would create a new, empty listing).
 name: "@foundrynet/forge"
-displayName: "Forge by Foundry Labs — Industrial Machine Intelligence"
+displayName: "Forge by FoundryNet — Industrial Machine Intelligence"
 description: >-
   Natural language to machine action. Cross-manufacturer industrial telemetry
   normalization across 46 vendor packs in 20 verticals, from a corpus of 16,908
@@ -43,4 +43,4 @@ keywords:
   - tamper-evident
   - work-records
 
-# Re-index nudge for Smithery (32 tools, mcp.foundrynet.io, Forge by Foundry Labs) — 2026-07-16
+# Re-index nudge for Smithery (32 tools, mcp.foundrynet.io, Forge by FoundryNet) — 2026-07-16

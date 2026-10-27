@@ -1,6 +1,6 @@
 # Security policy
 
-**Forge by Foundry Labs** · Foundry Labs LLC
+**Forge by FoundryNet** · Foundry Labs LLC
 
 ## Reporting a vulnerability
 
@@ -117,4 +117,4 @@ to monitoring.
 ---
 
 **Contact:** foundrynet@proton.me
-*Foundry Labs LLC · Forge by Foundry Labs*
+*Foundry Labs LLC · Forge by FoundryNet*
