@@ -842,7 +842,7 @@ async def fire_sandbox(
     USE WHEN: a developer is evaluating Forge and wants to feel the full
     loop (a webhook actually fires, a real settlement actually records, the
     verification link actually resolves) without onboarding any machines or
-    paying for the Pro tier. 10 fires lifetime per fnet_ key.
+    paying for the Pro tier. 10 fires lifetime per API key.
 
     Args:
         condition_text: A plain-English description of the condition the
