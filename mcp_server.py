@@ -1579,7 +1579,7 @@ async def server_card(request: Request) -> JSONResponse:
                     '      "args": ["-y", "mcp-remote",\n'
                     '               "https://mcp.foundrynet.io/mcp",\n'
                     '               "--header", "Authorization:Bearer ${FNET_KEY}"],\n'
-                    '      "env": { "FNET_KEY": "fnet_…  (free key at forge.foundrynet.io/)" }\n'
+                    '      "env": { "FNET_KEY": "<api_key>  (free key at forge.foundrynet.io/)" }\n'
                     '    }\n'
                     '  }\n'
                     '}'
@@ -1592,7 +1592,7 @@ async def server_card(request: Request) -> JSONResponse:
                     '      "args": ["-y", "mcp-remote",\n'
                     '               "https://mcp.foundrynet.io/mcp",\n'
                     '               "--header", "Authorization:Bearer ${FNET_KEY}"],\n'
-                    '      "env": { "FNET_KEY": "fnet_…" }\n'
+                    '      "env": { "FNET_KEY": "<api_key>" }\n'
                     '    }\n'
                     '  }\n'
                     '}'
@@ -1633,7 +1633,7 @@ async def server_card(request: Request) -> JSONResponse:
                 {"name": "verify_record",
                  "description": "Create a tamper-evident, independently verifiable, hash-chained record of work. Returns a record hash and a verify URL."},
                 {"name": "fire_sandbox",
-                 "description": "FREE-tier demo: fires a sample condition at the built-in /sandbox/echo endpoint, captures the response, and records a tamper-evident work record. Demonstrates the full watch→fire→settle loop end-to-end. Lifetime cap: 10 fires per fnet_ key — no credit card required."},
+                 "description": "FREE-tier demo: fires a sample condition at the built-in /sandbox/echo endpoint, captures the response, and records a tamper-evident work record. Demonstrates the full watch→fire→settle loop end-to-end. Lifetime cap: 10 fires per API key — no credit card required."},
                 {"name": "correct_mapping",
                  "description": "FREE: teach Forge the right canonical field when normalize_telemetry mapped a column wrong or abstained. Each correction is a corpus-improvement signal feeding an offline retrain."},
                 {"name": "get_coverage",
