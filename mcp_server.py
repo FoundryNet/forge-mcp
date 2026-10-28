@@ -1557,7 +1557,7 @@ async def server_card(request: Request) -> JSONResponse:
                 "action. The agent watches; you stay in the loop."
             ),
             # Smithery (and MCP-canonical) — lets the publish skip its scan.
-            "serverInfo": {"name": "Forge by Foundry Labs", "version": "3.4.4"},
+            "serverInfo": {"name": "Forge by FoundryNet", "version": "3.4.4"},
             "serverUrl": "https://mcp.foundrynet.io/mcp",
             "transport": "streamable-http",
             "auth": {
@@ -1579,7 +1579,7 @@ async def server_card(request: Request) -> JSONResponse:
                     '      "args": ["-y", "mcp-remote",\n'
                     '               "https://mcp.foundrynet.io/mcp",\n'
                     '               "--header", "Authorization:Bearer ${FNET_KEY}"],\n'
-                    '      "env": { "FNET_KEY": "fnet_…  (free key at forge.foundrynet.io/)" }\n'
+                    '      "env": { "FNET_KEY": "<api_key>  (free key at forge.foundrynet.io/)" }\n'
                     '    }\n'
                     '  }\n'
                     '}'
@@ -1592,7 +1592,7 @@ async def server_card(request: Request) -> JSONResponse:
                     '      "args": ["-y", "mcp-remote",\n'
                     '               "https://mcp.foundrynet.io/mcp",\n'
                     '               "--header", "Authorization:Bearer ${FNET_KEY}"],\n'
-                    '      "env": { "FNET_KEY": "fnet_…" }\n'
+                    '      "env": { "FNET_KEY": "<api_key>" }\n'
                     '    }\n'
                     '  }\n'
                     '}'
@@ -1633,7 +1633,7 @@ async def server_card(request: Request) -> JSONResponse:
                 {"name": "verify_record",
                  "description": "Create a tamper-evident, independently verifiable, hash-chained record of work. Returns a record hash and a verify URL."},
                 {"name": "fire_sandbox",
-                 "description": "FREE-tier demo: fires a sample condition at the built-in /sandbox/echo endpoint, captures the response, and records a tamper-evident work record. Demonstrates the full watch→fire→settle loop end-to-end. Lifetime cap: 10 fires per fnet_ key — no credit card required."},
+                 "description": "FREE-tier demo: fires a sample condition at the built-in /sandbox/echo endpoint, captures the response, and records a tamper-evident work record. Demonstrates the full watch→fire→settle loop end-to-end. Lifetime cap: 10 fires per API key — no credit card required."},
                 {"name": "correct_mapping",
                  "description": "FREE: teach Forge the right canonical field when normalize_telemetry mapped a column wrong or abstained. Each correction is a corpus-improvement signal feeding an offline retrain."},
                 {"name": "get_coverage",
@@ -1724,7 +1724,7 @@ async def wellknown_mcp_json(request: Request) -> JSONResponse:
     card can never drift from what the server actually enforces."""
     endpoint = "https://mcp.foundrynet.io/mcp"
     return JSONResponse({
-        "name": "Forge by Foundry Labs",
+        "name": "Forge by FoundryNet",
         "short_name": "foundrynet-forge",
         "description": ("Industrial AI infrastructure. MCP tools for cross-OEM "
                         "equipment normalization, prediction, and governance. "
@@ -1745,7 +1745,7 @@ async def wellknown_mcp_json(request: Request) -> JSONResponse:
         "attestation": {"enabled": True, "protocol": "attestation"},
         "network": {"name": "FoundryNet Data Network", "servers": 17,
                     "homepage": "https://foundrynet.io"},
-        "provider": {"name": "Foundry Labs", "url": "https://foundrynet.io"},
+        "provider": {"name": "FoundryNet", "url": "https://foundrynet.io"},
     }, headers={"Cache-Control": "public, max-age=300"})
 
 
@@ -1753,7 +1753,7 @@ async def wellknown_mcp_json(request: Request) -> JSONResponse:
 async def wellknown_agent_card(request: Request) -> JSONResponse:
     """A2A agent card — how other agents discover Forge's identity + tools."""
     return JSONResponse({
-        "name": "Forge by Foundry Labs",
+        "name": "Forge by FoundryNet",
         "description": ("Cross-OEM industrial telemetry normalization, runtime kernel, "
                         "and machine identity for industrial equipment. 46 vendor packs "
                         "across 20 verticals, 366 canonical fields."),
@@ -1761,7 +1761,7 @@ async def wellknown_agent_card(request: Request) -> JSONResponse:
         "version": "3.4.4",
         "capabilities": {"tools": ["normalize", "identify", "query_corpus",
                                    "coverage", "health_check"]},
-        "provider": {"name": "Foundry Labs", "url": "https://foundrynet.io"},
+        "provider": {"name": "FoundryNet", "url": "https://foundrynet.io"},
         "network": "FoundryNet Data Network",
         "attestation": {"protocol": "attestation",
                         "verified_outputs": True},
@@ -1895,7 +1895,7 @@ async def _a2a_dispatch(skill_id: str, params: dict) -> Optional[dict]:
 async def wellknown_a2a_agent_json(request: "Request") -> JSONResponse:
     """A2A Agent Card at the spec's canonical path. Public (discovery)."""
     return JSONResponse({
-        "name": "Forge by Foundry Labs",
+        "name": "Forge by FoundryNet",
         "description": ("Industrial AI infrastructure. Connects AI agents to industrial "
                         "equipment through 12 payload-decoding protocol adapters. Cross-OEM normalization, "
                         "physics-validated readings, health index, failure prediction, "
@@ -1952,7 +1952,7 @@ async def wellknown_a2a_agent_json(request: "Request") -> JSONResponse:
                     "transport": "streamable-http", "version": "2025-06-18"},
             "rest": {"endpoint": "https://forge.foundrynet.io",
                      "docs": "https://forge.foundrynet.io/docs"}},
-        "provider": {"organization": "Foundry Labs", "url": "https://foundrynet.io",
+        "provider": {"organization": "FoundryNet", "url": "https://foundrynet.io",
                      "contact": "foundrynet@proton.me"},
     }, headers={"Cache-Control": "public, max-age=300"})
 
