@@ -115,7 +115,7 @@ jobs:
           # and then skipped, which is a green tick over an unrun gate.
           # <0.23 because 0.23 changed the default loop scope and the session
           # fixtures in conftest.py are built on the 0.21 semantics.
-          python3 -m pip install -q 'pytest>=8' 'pytest-asyncio>=0.21,<0.23'
+          python3 -m pip install -q 'pytest>=8,<9.2' 'pytest-asyncio>=0.21,<0.23'
 
       # Cheapest possible check, so it runs before anything that takes time.
       # Gate 3 of scripts/release_gate.sh: the module must import and build its
