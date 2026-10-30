@@ -49,6 +49,7 @@ import json
 import logging
 import os
 from typing import Optional
+from urllib.parse import quote, unquote
 
 import httpx
 from fastmcp import FastMCP
@@ -249,6 +250,71 @@ def _may_retry(method: str, exc: BaseException, path: str = "",
     return False
 
 
+# ── Path parameters ──────────────────────────────────────────────────────────
+# Caller-supplied ids went into upstream paths raw: f"/v1/triggers/{trigger_id}".
+# httpx collapses dot segments, so delete_automation(trigger_id="../../v1/x")
+# sent DELETE to /v1/x -- measured 2026-10-30 (MCP audit G1). It ran under the
+# caller's own key, so it was not privilege escalation, but a tool an agent (or
+# the human approving it) was told deletes an automation could act on any route
+# that key reaches.
+#
+# Encoding alone is not enough: forge-prod's router matches on the
+# percent-DECODED path, so "x%2Frestore" arrives as /v1/triggers/x/restore -- a
+# different route under the same prefix. So a segment is refused, not just
+# encoded, when any decoding of it holds a separator, a dot segment or a control
+# character. Decoding repeats until stable, which is what catches %252e%252e.
+_SEG_MAX_LEN = 256
+_SEG_FORBIDDEN = ("/", "\\", "..")
+
+
+def _seg_problem(value) -> Optional[str]:
+    """Why `value` cannot be a path segment, or None if it can."""
+    if not isinstance(value, str) or not value.strip():
+        return "must be a non-empty string"
+    if len(value) > _SEG_MAX_LEN:
+        return f"longer than {_SEG_MAX_LEN} characters"
+    v = value
+    for _ in range(4):
+        if any(s in v for s in _SEG_FORBIDDEN) or v in (".",):
+            return "contains a path separator or dot segment"
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in v):
+            return "contains a control character"
+        decoded = unquote(v)
+        if decoded == v:
+            return None
+        v = decoded
+    return "is percent-encoded too many times"
+
+
+def _invalid_argument(field: str, value, reason: str) -> dict:
+    return {"error": "invalid_argument", "status": 400, "field": field,
+            "reason": f"{field} {reason}", "received_value": str(value)[:80]}
+
+
+def _seg(field: str, value) -> str:
+    """`value` as ONE encoded path segment. Raises ToolError (no upstream
+    request is made) when it is not a safe segment."""
+    problem = _seg_problem(value)
+    if problem:
+        raise ToolError(json.dumps(_invalid_argument(field, value, problem)))
+    return quote(value, safe="")
+
+
+def _path_problem(path: str) -> Optional[str]:
+    """Last check before the wire, for every upstream call. Catches a tool that
+    interpolated an id without `_seg`. A path whose every segment passes
+    `_seg_problem` holds no dot segment, raw or encoded, so neither httpx (which
+    resolves them) nor forge-prod's decoding router can turn it into a
+    different route: what is sent is the route the tool built."""
+    built = path.split("?", 1)[0]
+    if not built.startswith("/v1/"):
+        return "upstream path is outside /v1"
+    for s in built.split("/")[1:]:
+        if s and _seg_problem(s) is not None:
+            return "upstream path carries an unsafe segment"
+    return None
+
+
 async def _call_forge_raw(method: str, path: str, *,
                       body: Optional[dict] = None,
                       params: Optional[dict] = None) -> dict:
@@ -268,6 +334,10 @@ async def _call_forge_raw(method: str, path: str, *,
     failures, programmer errors) returns immediately with the error
     shape the LLM can read."""
     url = f"{FORGE_BASE_URL}{path}"
+    problem = _path_problem(path)
+    if problem:
+        logger.warning(f"_call_forge_raw refused {method} {path[:120]!r}: {problem}")
+        return _invalid_argument("path", path, problem)
     last_exc: Optional[BaseException] = None
     for attempt in range(2):
         try:
@@ -460,7 +530,7 @@ async def query_machine_history(
     if from_dt is not None: params["from"] = from_dt
     if to_dt is not None:   params["to"]   = to_dt
     if fields is not None:  params["fields"] = fields
-    return await _call_forge("GET", f"/v1/history/{mint_id}", params=params)
+    return await _call_forge("GET", f"/v1/history/{_seg('mint_id', mint_id)}", params=params)
 
 
 # ── Tool 4: create_automation ────────────────────────────────────────────────
@@ -671,7 +741,7 @@ async def disable_automation(trigger_id: str) -> dict:
     "pause the high-spindle alert during planned maintenance," "stop
     that alarm for now, I'll re-enable it tomorrow." Distinct from
     delete_automation, which is permanent."""
-    return await _call_forge("PATCH", f"/v1/triggers/{trigger_id}",
+    return await _call_forge("PATCH", f"/v1/triggers/{_seg('trigger_id', trigger_id)}",
                              body={"enabled": False})
 
 
@@ -693,7 +763,7 @@ async def delete_automation(trigger_id: str) -> dict:
     "delete the coolant alert," "remove that trigger." Safer than hard
     delete because misclicks are recoverable; tell the user about
     restore_automation if they later change their mind."""
-    return await _call_forge("DELETE", f"/v1/triggers/{trigger_id}")
+    return await _call_forge("DELETE", f"/v1/triggers/{_seg('trigger_id', trigger_id)}")
 
 
 # ── Tool 9: query_webhook_history ────────────────────────────────────────────
@@ -713,7 +783,7 @@ async def query_webhook_history(trigger_id: str, limit: int = 10) -> dict:
     Slack get pinged?" / "is the trigger working?" / "show me the last
     few fires." Soft-deleted triggers can still be queried — useful for
     forensic audits after a misclick + restore."""
-    return await _call_forge("GET", f"/v1/triggers/{trigger_id}/executions",
+    return await _call_forge("GET", f"/v1/triggers/{_seg('trigger_id', trigger_id)}/executions",
                              params={"limit": limit})
 
 
@@ -734,7 +804,7 @@ async def restore_automation(trigger_id: str) -> dict:
     Also useful as the "undo" half of a "delete then change my mind"
     flow — pair with disable_automation when the user wants to pause
     rather than delete in the first place."""
-    return await _call_forge("PATCH", f"/v1/triggers/{trigger_id}/restore")
+    return await _call_forge("PATCH", f"/v1/triggers/{_seg('trigger_id', trigger_id)}/restore")
 
 
 # ── Tool 11: verify_record (backward-compat alias: verify_on_chain) ──────────
@@ -948,7 +1018,7 @@ async def correct_mapping(
     if oem is not None:          body["oem_hint"] = oem
     if sample_value is not None: body["sample_value"] = sample_value
     if confidence is not None:   body["confidence"] = confidence
-    return await _call_forge("POST", f"/v1/feedback/{mid}/correct", body=body)
+    return await _call_forge("POST", f"/v1/feedback/{_seg('mapping_id', mid)}/correct", body=body)
 
 
 # ── Tool 14: get_coverage ────────────────────────────────────────────────────
@@ -1272,7 +1342,7 @@ async def calculate_oee(machine_id: str, period: str = "shift") -> dict:
     where the losses are, or produce a single number for a line. FREE — OEE is
     the metric that embeds Forge in daily operations.
     """
-    return await _call_forge("GET", f"/v1/oee/{machine_id}", params={"period": period})
+    return await _call_forge("GET", f"/v1/oee/{_seg('machine_id', machine_id)}", params={"period": period})
 
 
 @mcp.tool
@@ -1302,7 +1372,7 @@ async def energy_consumption(machine_id: str, period: str = "shift") -> dict:
     USE WHEN: your agent needs to compute what a machine costs to run, or catch
     an energy anomaly (a spike vs the rolling baseline).
     """
-    return await _call_forge("GET", f"/v1/energy/{machine_id}", params={"period": period})
+    return await _call_forge("GET", f"/v1/energy/{_seg('machine_id', machine_id)}", params={"period": period})
 
 
 @mcp.tool
@@ -1345,7 +1415,7 @@ async def diagnose_machine(
     body: dict = {}
     if event_time is not None: body["event_time"] = event_time
     if symptom is not None:    body["symptom"] = symptom
-    return await _call_forge("POST", f"/v1/diagnose/{machine_id}", body=body)
+    return await _call_forge("POST", f"/v1/diagnose/{_seg('machine_id', machine_id)}", body=body)
 
 
 # ── Tool 28 (meta): get_agent_card ───────────────────────────────────────────
@@ -1370,7 +1440,7 @@ async def get_agent_card(agent_id: Optional[str] = None) -> dict:
       agent_id  the connected agent's id. Omit to get the built-in Forge
                 Intelligence card (the kernel's own credentials + NASA benchmark).
     """
-    return await _call_forge("GET", f"/v1/agents/{agent_id or 'builtin'}/card")
+    return await _call_forge("GET", f"/v1/agents/{_seg('agent_id', agent_id or 'builtin')}/card")
 
 
 @mcp.tool
@@ -1421,7 +1491,7 @@ async def health_index(machine_id: str, period: str = "shift") -> dict:
     (declining / stable / improving), degradation rate, estimated remaining
     useful life in steps, and the top factors driving the decline.
     """
-    return await _call_forge("GET", f"/v1/health_index/{machine_id}")
+    return await _call_forge("GET", f"/v1/health_index/{_seg('machine_id', machine_id)}")
 
 
 # ── Health route (mounted on the SSE app via FastMCP custom_route) ──────────
@@ -1881,7 +1951,10 @@ async def _a2a_dispatch(skill_id: str, params: dict) -> Optional[dict]:
         for k in ("event_time", "symptom"):
             if params.get(k) is not None:
                 body[k] = params[k]
-        return await _call_forge_raw("POST", f"/v1/diagnose/{mid}", body=body)
+        problem = _seg_problem(mid)
+        if problem:
+            return _invalid_argument("machine_id", mid, problem)
+        return await _call_forge_raw("POST", f"/v1/diagnose/{quote(mid, safe='')}", body=body)
     if skill_id == "agent_trust":
         qp: dict = {}
         for k in ("capability", "min_trust_score", "machine_id"):
@@ -1992,6 +2065,8 @@ async def a2a_create_task(request: "Request") -> JSONResponse:
         release_caller(reset)
     if result is None:
         return JSONResponse({"error": f"Unknown skill: {skill_id}"}, status_code=400)
+    if isinstance(result, dict) and result.get("error") == "invalid_argument":
+        return JSONResponse(result, status_code=400)
     # No cost-ledger write: forge-prod writes that row under this caller's own
     # key id now that the upstream call authenticates as them. See
     # gating.log_usage for why writing it here too double-counted.
