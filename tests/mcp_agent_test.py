@@ -818,8 +818,9 @@ async def test_coverage_counts_say_what_they_measure(forge):
     """Coverage returns the registry count, the family count and pack stats -
     and each is checked against the thing it actually measures.
 
-    1,027 is the REGISTRY (1,016 until the 11 electrical-safety canonicals landed
-    2026-10-17). It is not the corpus count, not the pack-mapping
+    1,032 is the REGISTRY (1,016 until the 11 electrical-safety canonicals landed
+    2026-10-17; 1,027 until forge-prod #234/#239 added the influent/effluent and
+    stress-battery fields, 2026-10-28/29). It is not the corpus count, not the pack-mapping
     count, and not deterministic reach. The response keeps them under separate
     names and the corpus-derived ones come back null offline rather than
     borrowing the registry's number, which is exactly the drift that made the
@@ -832,16 +833,16 @@ async def test_coverage_counts_say_what_they_measure(forge):
     packs = body["vertical_packs"]
 
     assert body["canonical_field_count"] == len(_registry.fields())
-    assert body["canonical_field_count"] == 1027, (
+    assert body["canonical_field_count"] == 1032, (
         f"the registry is now {body['canonical_field_count']} fields, not "
-        f"1,027 - CLAUDE.md quotes it")
+        f"1,032 - prod /health reports it")
     assert body["family_count"] == len(body["canonical_families"])
     assert body["corpus_oem_tags"] is None
     assert body["corpus_mapped_field_count"] is None
     assert len(packs["verticals"]) == 20, packs["verticals"]
-    assert packs["packs_loaded"] == 47, (
-        f"{packs['packs_loaded']} packs loaded, not 47 - CLAUDE.md quotes "
-        f"\"47 vendor packs across 20 verticals\"")
+    assert packs["packs_loaded"] == 49, (
+        f"{packs['packs_loaded']} packs loaded, not 49 - prod /health reports "
+        f"49 vendor packs across 20 verticals")
     assert packs["total_pack_mappings"] > 2000, packs["total_pack_mappings"]
     # CLAUDE.md: auto-pack is DESIGNED, NOT RUNNING. It has never fired, and
     # the local pack layer agrees - 0 auto-pack mappings. Asserted so a demo
@@ -867,7 +868,7 @@ async def test_coverage_counts_say_what_they_measure(forge):
             "verticals_without_oem_routing": body["verticals_without_oem_routing"],
             "corpus_derived_counts": "null offline (see _local_backend)",
         },
-        assertion=("canonical_field_count == the 1,027-field registry; "
+        assertion=("canonical_field_count == the 1,032-field registry; "
                    "families partition it exactly; 20 pack verticals; "
                    "corpus-derived counts are null, not borrowed"))
 

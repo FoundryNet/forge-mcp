@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -308,12 +309,42 @@ def test_a_PRESENT_stamp_is_what_health_reports(tmp_path):
     assert info["stamped"] is True
 
 
+# A Forge API key is a namespace prefix + secrets.token_urlsafe(32): 43 url-safe
+# characters. The scan matches that SHAPE. It used to match the bare "fnet_",
+# which a commit SUBJECT can legitimately contain -- acf1f48 was "fix: replace
+# fnet_ wording in MCP tool description" -- and its stamp then failed the
+# release gate for the NEXT deploy, while a forge_prod_/forge_sandbox_/
+# forge_agent_ key would not have been caught at all.
+_KEY_SHAPE = re.compile(
+    r"(fnet_|forge_prod_|forge_sandbox_|forge_monitor_|forge_agent_)[a-z0-9_-]{32,}")
+_FORBIDDEN = ("supabase_service_key", "sb_secret", "sk_live", "jwt_secret",
+              "stripe", "bearer ")
+
+
+def _leaks(info: dict) -> list:
+    blob = json.dumps(info).lower()
+    found = [f for f in _FORBIDDEN if f in blob]
+    found += [m.group(0)[:16] + "..." for m in _KEY_SHAPE.finditer(blob)]
+    return found
+
+
 def test_the_build_block_leaks_no_configuration_values():
     """/health is unauthenticated. The stamp names a commit and a hash; it must
     never carry an env value, and `stamped_by` is a username, not a secret."""
     import mcp_server
 
-    blob = json.dumps(mcp_server._BUILD_INFO).lower()
-    for forbidden in ("supabase_service_key", "fnet_", "sb_secret", "sk_live",
-                      "jwt_secret", "stripe", "bearer "):
-        assert forbidden not in blob, f"the build block carries {forbidden!r}"
+    assert _leaks(mcp_server._BUILD_INFO) == [], "the build block carries a secret"
+
+
+@pytest.mark.parametrize("prefix", ["fnet_", "forge_prod_", "forge_sandbox_",
+                                    "forge_monitor_", "forge_agent_"])
+def test_the_leak_scan_catches_a_key_and_spares_a_subject_naming_its_prefix(prefix):
+    """The scan above runs on whatever stamp is on disk, so it is pinned here on
+    fixed input both ways."""
+    import secrets
+    subject = {"commit_subject": f"fix: replace {prefix} wording in MCP tool description"}
+    assert _leaks(subject) == []
+    key = {"commit_subject": f"oops {prefix}{secrets.token_urlsafe(32)}"}
+    assert _leaks(key), f"a {prefix} key in the build block was not caught"
+    for f in _FORBIDDEN:
+        assert _leaks({"note": f"x {f} y"}), f
