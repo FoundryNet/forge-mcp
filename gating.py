@@ -176,9 +176,23 @@ OAUTH_ISSUER    = (os.environ.get("MCP_OAUTH_ISSUER")
                    or "https://mcp.foundrynet.io").rstrip("/")
 
 
+# OFF by default (MCP audit G9, 2026-10-30). Every tool call made with a JWT is
+# refused (`enforce_call`: a JWT carries a key id, not a key forge-prod accepts,
+# so the call cannot be scoped to the caller's tenant), which meant /oauth/token
+# minted credentials that could call nothing. Until a real token exchange
+# exists, issuance AND acceptance stay off. Set ENABLE_OAUTH_EXCHANGE=true (with
+# MCP_JWT_SECRET) to turn the existing flow back on. Read at import; a module
+# attribute so a test can flip it.
+OAUTH_EXCHANGE_ENABLED = (os.environ.get("ENABLE_OAUTH_EXCHANGE") or "false").strip().lower() == "true"
+OAUTH_DISABLED_MESSAGE = (
+    "OAuth token exchange not yet available. Authenticate with "
+    "`Authorization: Bearer <your Forge API key>`.")
+
+
 def oauth_enabled() -> bool:
-    """True only when JWTs can actually be signed/verified."""
-    return bool(_pyjwt and JWT_SECRET)
+    """True only when the exchange is switched on AND JWTs can actually be
+    signed/verified."""
+    return bool(OAUTH_EXCHANGE_ENABLED and _pyjwt and JWT_SECRET)
 
 
 _client: Optional[Client] = None

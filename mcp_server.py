@@ -1733,10 +1733,10 @@ async def wellknown_mcp_json(request: Request) -> JSONResponse:
         "url": endpoint,
         "endpoint": endpoint,
         "transport": ["streamable-http"],
-        "auth": {
+        "auth": ({
             "schemes": ["bearer", "oauth2-client-credentials"],
             "oauth_metadata": "/.well-known/oauth-authorization-server",
-        },
+        } if gating.OAUTH_EXCHANGE_ENABLED else {"schemes": ["bearer"]}),
         "tools_count": len(await mcp.list_tools()),
         "free_tools": sorted(FREE_TOOLS),
         "pricing": {"model": "per-query", "free_tier": True},
@@ -1942,11 +1942,12 @@ async def wellknown_a2a_agent_json(request: "Request") -> JSONResponse:
                           "Get trust score breakdown for an agent",
                           "Compare agent performance on this equipment"]},
         ],
-        "authentication": {
+        "authentication": ({
             "schemes": ["bearer", "oauth2"],
             "oauth2": {"tokenUrl": "https://mcp.foundrynet.io/oauth/token",
                        "grantTypes": ["client_credentials"],
-                       "discoveryUrl": "https://mcp.foundrynet.io/.well-known/oauth-authorization-server"}},
+                       "discoveryUrl": "https://mcp.foundrynet.io/.well-known/oauth-authorization-server"}}
+            if gating.OAUTH_EXCHANGE_ENABLED else {"schemes": ["bearer"]}),
         "protocols": {
             "mcp": {"endpoint": "https://mcp.foundrynet.io/mcp",
                     "transport": "streamable-http", "version": "2025-06-18"},
@@ -2068,11 +2069,21 @@ async def a2a_list_agents(request: "Request") -> JSONResponse:
 # JWT, present it as a Bearer token. The gating middleware accepts BOTH that JWT
 # and the raw key (gating.resolve_bearer), so this is purely additive.
 
+def _oauth_disabled() -> JSONResponse:
+    return JSONResponse(
+        {"error": "not_implemented", "error_description": gating.OAUTH_DISABLED_MESSAGE},
+        status_code=501, headers={"Cache-Control": "no-store"})
+
+
 @mcp.custom_route("/oauth/token", methods=["POST"])
 async def oauth_token(request: Request) -> JSONResponse:
     """RFC 6749 §4.4 token endpoint. Reads client_id/client_secret from the
     form body (client_secret_post) or a Basic auth header (client_secret_basic).
-    client_secret IS the caller's Forge API key. Returns a 1-hour JWT."""
+    client_secret IS the caller's Forge API key. Returns a 1-hour JWT.
+
+    501 unless ENABLE_OAUTH_EXCHANGE=true (see gating.OAUTH_EXCHANGE_ENABLED)."""
+    if not gating.OAUTH_EXCHANGE_ENABLED:
+        return _oauth_disabled()
     # Body params (client_secret_post) — OAuth clients send form-urlencoded,
     # but accept JSON too for hand-rolled callers.
     ctype = request.headers.get("content-type", "")
@@ -2127,7 +2138,11 @@ async def oauth_metadata(request: Request) -> JSONResponse:
     """RFC 8414 authorization-server metadata — AgentCore / Foundry dereference
     this to auto-discover the token endpoint and supported grant types. This is
     a machine-to-machine server, so there is no interactive authorization
-    endpoint (response_types_supported is empty)."""
+    endpoint (response_types_supported is empty). 501 while the exchange is
+    disabled: metadata advertising a token endpoint that refuses is the
+    confusing surface G9 removed."""
+    if not gating.OAUTH_EXCHANGE_ENABLED:
+        return _oauth_disabled()
     return JSONResponse(
         {
             "issuer":                                 OAUTH_ISSUER,

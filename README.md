@@ -177,7 +177,8 @@ Get a free `fnet_` key at https://foundrynet.io/signup?utm_source=github&utm_med
 |---|---|---|
 | `FOUNDRYNET_API_KEY` | No longer used on the tool path | Kept for the boot-time config report only; tool calls run as the caller's own key |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` | Yes for gating | unset = gating disabled, fail-open |
-| `MCP_JWT_SECRET` | No | unset = OAuth token issuance disabled (503), key auth unaffected |
+| `ENABLE_OAUTH_EXCHANGE` | No | default `false`: `/oauth/token` and its metadata answer 501 and JWTs are not accepted (G9). `true` re-enables the client-credentials flow |
+| `MCP_JWT_SECRET` | No | with the exchange enabled: unset = issuance answers 503; key auth unaffected |
 | `FORGE_BASE_URL` | No | `https://forge.foundrynet.io` |
 | `PORT` | No | 8080 (Railway sets this automatically) |
 | `REQUEST_TIMEOUT` | No | 120 (seconds) |

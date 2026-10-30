@@ -163,7 +163,7 @@ def test_no_upstream_header_builder_reads_the_shared_key():
         f"the shared server key is being put on a request again: {offending}")
 
 
-async def test_an_oauth_caller_gets_a_PARSEABLE_refusal_over_the_wire(upstream):
+async def test_an_oauth_caller_gets_a_PARSEABLE_refusal_over_the_wire(upstream, monkeypatch):
     """Review gap: the refusal was only ever asserted by calling `_headers()`
     directly, so nobody noticed the over-the-wire shape was prose.
 
@@ -177,8 +177,10 @@ async def test_an_oauth_caller_gets_a_PARSEABLE_refusal_over_the_wire(upstream):
     import gating as g
     from mcp_client import MCPSession, app_client
 
-    if not g.oauth_enabled():
-        pytest.skip("OAuth signing not configured in this harness")
+    # The exchange is off by default (G9); these pin what a JWT caller gets IF
+    # it is switched back on, so they switch it on rather than skip.
+    monkeypatch.setattr(g, "OAUTH_EXCHANGE_ENABLED", True)
+    assert g.oauth_enabled(), "harness sets MCP_JWT_SECRET; signing must be available"
     minted = g.issue_access_token("harness", TENANT_A_KEY)
     assert minted and minted.get("access_token")
 
@@ -197,7 +199,7 @@ async def test_an_oauth_caller_gets_a_PARSEABLE_refusal_over_the_wire(upstream):
             assert upstream.forge_requests == [], f"{name} reached the kernel"
 
 
-async def test_an_oauth_caller_is_refused_before_spending_anything(fake_db):
+async def test_an_oauth_caller_is_refused_before_spending_anything(fake_db, monkeypatch):
     """And the refusal costs them nothing. It used to be raised at the upstream
     hop, i.e. after the cap counter had already spent a call — and after
     `fire_sandbox` had spent one of its TEN LIFETIME fires and really posted to
@@ -205,8 +207,10 @@ async def test_an_oauth_caller_is_refused_before_spending_anything(fake_db):
     import gating as g
     from mcp_client import MCPSession, app_client
 
-    if not g.oauth_enabled():
-        pytest.skip("OAuth signing not configured in this harness")
+    # The exchange is off by default (G9); these pin what a JWT caller gets IF
+    # it is switched back on, so they switch it on rather than skip.
+    monkeypatch.setattr(g, "OAUTH_EXCHANGE_ENABLED", True)
+    assert g.oauth_enabled(), "harness sets MCP_JWT_SECRET; signing must be available"
     minted = g.issue_access_token("harness", TENANT_A_KEY)
     async with app_client() as client:
         s = MCPSession(client, minted["access_token"])
