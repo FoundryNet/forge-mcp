@@ -31,8 +31,10 @@ from toolargs import ARGS
 # mark also lands on the sync ones and emits a warning per test.
 
 PRIVATE_PATHS = ["/mcp", "/sse", "/messages", "/a2a/tasks", "/a2a/agents", "/oauth/token"]
+# /.well-known/oauth-authorization-server left this list with G9: it answers 501
+# while the OAuth exchange is disabled (tests/test_oauth_disabled.py).
 PUBLIC_PATHS = ["/.well-known/mcp/server-card.json", "/.well-known/agent.json",
-                "/.well-known/oauth-authorization-server", "/health", "/ping"]
+                "/health", "/ping"]
 
 
 # ── The declared gap ─────────────────────────────────────────────────────────
