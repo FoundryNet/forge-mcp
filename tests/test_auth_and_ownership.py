@@ -49,7 +49,7 @@ async def test_unknown_tool_is_never_routed_to_the_paywall():
 
 
 async def test_sandbox_key_is_refused_every_paid_tool_and_allowed_every_free_one(upstream):
-    """Both halves, counted. n = 32."""
+    """Both halves, counted. n = 36."""
     paid = sorted(gating.ALL_TOOLS - gating.FREE_TOOLS)
     free = sorted(gating.FREE_TOOLS)
     async with session(SANDBOX_KEY) as s:
@@ -63,7 +63,7 @@ async def test_sandbox_key_is_refused_every_paid_tool_and_allowed_every_free_one
             upstream.reset()
             out = await s.call(name, ARGS[name])
             assert out["ok"], f"sandbox key refused FREE tool {name}: {out.get('error')}"
-    assert len(paid) + len(free) == 32
+    assert len(paid) + len(free) == 36
 
 
 async def test_metered_key_with_no_card_gets_only_the_truly_free_set(upstream):

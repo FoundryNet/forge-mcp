@@ -39,7 +39,7 @@ from toolargs import ARGS
 
 
 async def test_no_tool_call_writes_a_cost_ledger_row(fake_db):
-    """n = 32 tools. Not one `forge_api_usage` insert from this process."""
+    """n = 36 tools. Not one `forge_api_usage` insert from this process."""
     async with session(TENANT_A_KEY) as s:
         for name in sorted(gating.ALL_TOOLS):
             out = await s.call(name, ARGS[name])
