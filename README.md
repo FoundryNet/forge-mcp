@@ -4,7 +4,7 @@ The cross-manufacturer industrial MCP server. Talk to any CNC, robot, or industr
 machine in natural language — machine identity, telemetry normalization across 46
 vendor packs in 20 verticals, plain-English automation, and tamper-evident work records.
 
-Hosted MCP over Streamable HTTP. 32 tools wrap the Forge v1 API: provision a stable machine
+Hosted MCP over Streamable HTTP. 36 tools wrap the Forge v1 API: provision a stable machine
 identity, normalize raw OEM telemetry into a canonical schema, query operational history,
 parse and activate plain-English automations, predict failures (TimesFM), score fleet health,
 and record every state-changing action as a verifiable, tamper-evident work record.
@@ -119,7 +119,7 @@ words — `build_info.json absent — deploy did not run stamp_build.py`, with
 `commit`, `content_hash` and `built_at` present and null — because a null that
 looks like a missing field is indistinguishable from a stamped build.
 
-## Tools (32)
+## Tools (36)
 
 Identity & data: `identify_machine`, `normalize_telemetry`, `query_machine_history`,
 `get_coverage`, `correct_mapping`. Automation: `create_automation`, `activate_automation`,
@@ -185,7 +185,7 @@ Get a free `fnet_` key at https://foundrynet.io/signup?utm_source=github&utm_med
 
 ## Files
 
-- `mcp_server.py` — the server (32 tools + `/health` + `/.well-known/mcp` routes)
+- `mcp_server.py` — the server (36 tools + `/health` + `/.well-known/mcp` routes)
 - `gating.py` — per-client tier gating (Free vs Pro tool/quota enforcement)
 - `server.json` — MCP registry metadata (name, description, keywords, remote endpoint)
 - `smithery.yaml` — Smithery listing metadata

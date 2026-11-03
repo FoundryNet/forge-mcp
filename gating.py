@@ -13,7 +13,7 @@ Tiers (Enterprise + attest_machine_action are deferred):
                        self-serve; `plan='sandbox'`, or legacy `free_tier=true`.
   • Metered, no card — narrowed further to TRULY_FREE_TOOLS, mirroring the REST
                        402 for a cardless metered key.
-  • Pro              — all 32 tools, 10 000 calls/month.
+  • Pro              — all 36 tools, 10 000 calls/month.
 
 Tool COUNTS are deliberately not quoted here. They are asserted against
 forge-prod's own meter map by tests/test_rest_mcp_parity.py, because a count in
@@ -92,6 +92,10 @@ FREE_TOOLS: frozenset[str] = frozenset({
     "fleet_oee",               # whole-floor OEE — free per rate card
     "energy_consumption",      # energy + cost per machine — free per rate card
     "shift_report",            # shift handover summary — free per rate card
+    "set_alert",               # alert rules ride on triggers: free like create_automation
+    "list_alerts",
+    "delete_alert",
+    "alert_history",
     "detect_anomalies",        # statistical anomaly detection — no ML inference, and
     #   forge-prod carries NO meter on POST /v1/anomaly and prices it 0.00, so it was
     #   free over REST and Pro-only over MCP: the free tier meant two different things
@@ -763,6 +767,10 @@ TOOL_COSTS: dict[str, float] = {
     "disable_automation": 0.00,
     "restore_automation": 0.00,
     "query_webhook_history": 0.00,
+    "set_alert": 0.00,
+    "list_alerts": 0.00,
+    "delete_alert": 0.00,
+    "alert_history": 0.00,
 }
 
 

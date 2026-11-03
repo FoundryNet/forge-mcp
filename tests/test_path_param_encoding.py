@@ -22,6 +22,7 @@ TOOLS = {
     "delete_automation":     ("trigger_id", {}, "/v1/triggers/{}"),
     "restore_automation":    ("trigger_id", {}, "/v1/triggers/{}/restore"),
     "query_webhook_history": ("trigger_id", {}, "/v1/triggers/{}/executions"),
+    "delete_alert":          ("alert_id", {}, "/v1/alerts/{}"),
     "calculate_oee":         ("machine_id", {}, "/v1/oee/{}"),
     "energy_consumption":    ("machine_id", {}, "/v1/energy/{}"),
     "diagnose_machine":      ("machine_id", {}, "/v1/diagnose/{}"),

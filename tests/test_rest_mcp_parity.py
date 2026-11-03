@@ -76,7 +76,7 @@ def test_the_extraction_itself_worked():
 def test_every_tool_maps_to_at_least_one_rest_endpoint():
     """A tool whose route cannot be read is a tool the measurement would omit."""
     r = toolroutes.resolved_routes()
-    assert len(r) == 32, f"read routes for {len(r)} of 32 tools: {sorted(r)}"
+    assert len(r) == 36, f"read routes for {len(r)} of 36 tools: {sorted(r)}"
     for tool, calls in r.items():
         assert calls, f"{tool} has no readable kernel call"
 
@@ -118,7 +118,7 @@ def test_free_tier_parity_rest_vs_mcp():
     wider = {r["key"] for r in rows if r["free_on_mcp"] and not r["free_on_rest"]}
 
     report = (
-        f"\nREST/MCP free-tier parity — n = {n} (tool, endpoint) pairs over 32 tools\n"
+        f"\nREST/MCP free-tier parity — n = {n} (tool, endpoint) pairs over 36 tools\n"
         f"  gate source   : {PROD.source}\n"
         f"  MCP free set  : {len(gating.FREE_TOOLS)} tools\n"
         f"  REST free set : {len(PROD.sandbox_free_tool_names)} tools (prod's echo)\n"
@@ -147,7 +147,8 @@ def test_the_free_tool_sets_are_identical_name_for_name():
         f"free tier differs by transport.\n"
         f"  only on MCP : {sorted(mcp_free - rest_free)}\n"
         f"  only on REST: {sorted(rest_free - mcp_free)}")
-    assert len(mcp_free) == 20, f"the free tier is {len(mcp_free)} tools, not 20"
+    # 20 -> 24 with set_alert / list_alerts / delete_alert / alert_history (2026-11-02)
+    assert len(mcp_free) == 24, f"the free tier is {len(mcp_free)} tools, not 24"
 
 
 @needs_prod
@@ -205,7 +206,7 @@ def test_truly_free_tools_are_a_subset_of_the_free_tier():
     tool the free tier does not, the narrower tier would be the wider one."""
     assert gating.TRULY_FREE_TOOLS <= gating.FREE_TOOLS
     assert gating.FREE_TOOLS <= gating.ALL_TOOLS
-    assert len(gating.ALL_TOOLS) == 32
+    assert len(gating.ALL_TOOLS) == 36
 
 
 def test_every_free_tool_is_priced_zero():

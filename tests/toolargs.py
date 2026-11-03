@@ -11,6 +11,10 @@ from __future__ import annotations
 TS = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
 
 ARGS: dict[str, dict] = {
+    "alert_history": {},
+    "delete_alert": {"alert_id": "a-1"},
+    "list_alerts": {},
+    "set_alert": {"field": "spindle_load_pct", "type": "threshold", "op": ">", "value": 85},
     "activate_automation": {"machine_id": "m-1", "name": "n", "condition": {"field": "spindle_load_pct", "op": ">", "value": 80},
                             "actions": [{"type": "webhook", "url": "https://x.invalid"}]},
     "calculate_oee": {"machine_id": "m-1"},

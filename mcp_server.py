@@ -1,4 +1,4 @@
-"""FoundryNet MCP Server — 32 tools wrapping the live Forge v1 API,
+"""FoundryNet MCP Server — 36 tools wrapping the live Forge v1 API,
 gated per-client by fnet_ tier (Free vs Pro) as of 2026-05-28.
 
 Connects any AI agent to industrial equipment over the Model Context
@@ -12,7 +12,7 @@ Protocol so any compatible agent (Claude Desktop, Cursor, etc.) can:
 Per-call gating (see gating.py): every tools/call must carry a
 `Authorization: Bearer <Forge API key>` header on the wire. The middleware
 validates the key against Supabase, resolves the tier (free/sandbox -> the 20
-free tools, 100 calls/mo; pro -> all 32, 10 000 calls/mo), and atomically
+free tools, 100 calls/mo; pro -> all 36, 10 000 calls/mo), and atomically
 increments a monthly counter. Tier, cap and payment violations surface as
 structured JSON ToolError payloads with
 `upgrade_url: forge.foundrynet.io/pricing`.
@@ -1492,6 +1492,83 @@ async def health_index(machine_id: str, period: str = "shift") -> dict:
     useful life in steps, and the top factors driving the decline.
     """
     return await _call_forge("GET", f"/v1/health_index/{_seg('machine_id', machine_id)}")
+
+
+# ── Tools 33-36: alert rules ─────────────────────────────────────────────────
+# Alerts are triggers with plain-English output (forge-prod /v1/alerts): the
+# rule is stored and evaluated on every normalize call server-side, so the shop
+# runs nothing locally. Firings are logged with the message a shop owner reads.
+
+@mcp.tool
+async def set_alert(field: str, type: str = "threshold", machine_id: str = "all",
+                    op: str | None = None, value: float | None = None,
+                    direction: str | None = None, min_change: float | None = None,
+                    window_minutes: int | None = None, sensitivity: str | None = None,
+                    severity: str = "warning", cooldown_minutes: int = 60,
+                    webhook_url: str | None = None, name: str | None = None) -> dict:
+    """Create a persistent alert rule on a CANONICAL field (e.g. spindle_load_pct,
+    vibration_rms, bearing_temperature, motor_current_a) for one machine or "all".
+
+    Translate the user's words into ONE of four types:
+      threshold  "over 85%"          -> op ">" , value 85
+      trend      "climbing by 0.5"   -> direction "up", min_change 0.5, window_minutes 60
+      rate       "jumps 2 A a minute"-> op ">", value 2 (per minute), window_minutes 10
+      abnormal   "above normal"      -> sensitivity "normal" (learns each machine for 24 h
+                                        first, then ignores shop-wide day/night swings)
+    severity: info | warning | critical. Without webhook_url the alert is logged
+    (read it with alert_history); with one, Forge also POSTs each firing there.
+
+    Forge refuses (422, with suggestions) a field it does not know, or a threshold
+    outside what that field can physically read -- relay the reason to the user
+    rather than retrying with a guess. Use get_coverage first if unsure of the
+    field name.
+
+    USE WHEN: "alert me if…", "tell me when…", "watch machine #3's…",
+    "let me know if anything runs hot"."""
+    body: dict = {"field": field, "type": type, "machine_id": machine_id or "all",
+                  "severity": severity, "cooldown_minutes": cooldown_minutes}
+    for k, v in (("op", op), ("value", value), ("direction", direction), ("min_change", min_change),
+                 ("window_minutes", window_minutes), ("sensitivity", sensitivity), ("name", name)):
+        if v is not None:
+            body[k] = v
+    body["notify"] = {"method": "webhook", "url": webhook_url} if webhook_url else {"method": "log"}
+    return await _call_forge("POST", "/v1/alerts", body=body)
+
+
+@mcp.tool
+async def list_alerts() -> dict:
+    """Every active alert rule on this account, across all machines, with its
+    field (and a plain-English label), type, condition, and how it notifies.
+
+    USE WHEN: "what alerts do I have?", "am I watching spindle load?",
+    before set_alert to avoid creating a duplicate."""
+    return await _call_forge("GET", "/v1/alerts")
+
+
+@mcp.tool
+async def delete_alert(alert_id: str) -> dict:
+    """Remove an alert rule by its id (from list_alerts). Past firings stay in
+    alert_history.
+
+    USE WHEN: "stop alerting me about…", "delete the coolant alert"."""
+    return await _call_forge("DELETE", f"/v1/alerts/{_seg('alert_id', alert_id)}")
+
+
+@mcp.tool
+async def alert_history(machine_id: str | None = None, severity: str | None = None,
+                        limit: int = 20) -> dict:
+    """Recent alert firings, newest first: machine, what changed and by how much,
+    severity, and the suggested action, as a plain-English message per firing.
+    Optional filters: machine_id, severity (info | warning | critical).
+
+    USE WHEN: "did anything alert today?", "what happened on #3 overnight?",
+    "show me the critical alerts this week"."""
+    params: dict = {"limit": limit}
+    if machine_id:
+        params["machine_id"] = machine_id
+    if severity:
+        params["severity"] = severity
+    return await _call_forge("GET", "/v1/alerts/history", params=params)
 
 
 # ── Health route (mounted on the SSE app via FastMCP custom_route) ──────────

@@ -66,7 +66,7 @@ def test_the_pinned_libraries_do_not_support_cachescope_natively():
 # ── What is achievable: the result-level declaration ─────────────────────────
 
 async def test_every_tool_result_declares_a_private_cache_scope():
-    """n = 32 tools. A result that does not declare its scope is a result an
+    """n = 36 tools. A result that does not declare its scope is a result an
     intermediary may treat as shareable."""
     async with session(TENANT_A_KEY) as s:
         tools = sorted(t.name for t in await __import__("mcp_server").mcp.list_tools())
@@ -78,7 +78,7 @@ async def test_every_tool_result_declares_a_private_cache_scope():
             if not isinstance(meta, dict) or meta.get("cacheScope") != "private":
                 missing.append((name, meta))
     assert not missing, f"tool results with no private cache scope: {missing}"
-    assert len(tools) == 32
+    assert len(tools) == 36
 
 
 async def test_a_refusal_is_covered_by_the_http_half_not_the_meta_half():

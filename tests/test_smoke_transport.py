@@ -14,7 +14,7 @@ async def test_initialize_and_list_tools():
     async with session(TENANT_A_KEY) as s:
         tools = await s.list_tools()
         names = {t["name"] for t in tools}
-        assert len(names) == 32, f"expected 32 tools, got {len(names)}: {sorted(names)}"
+        assert len(names) == 36, f"expected 36 tools, got {len(names)}: {sorted(names)}"
 
 
 async def test_a_tool_call_reaches_upstream(upstream):

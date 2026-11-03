@@ -1,4 +1,4 @@
-"""The whole 32-tool surface, swept — tenancy and the reintroduction variants.
+"""The whole 36-tool surface, swept — tenancy and the reintroduction variants.
 
 The nine tools in `test_tenancy_isolation.py` are the ones whose leak is easiest
 to describe. They are not the whole surface. This file calls EVERY tool and
@@ -41,10 +41,10 @@ async def test_every_tool_has_sweep_arguments():
     extra = [n for n in ARGS if n not in names]
     assert not missing, f"tools with no sweep arguments: {missing}"
     assert not extra, f"sweep arguments for tools that do not exist: {extra}"
-    assert len(names) == 32, f"tool count changed: {len(names)}"
+    assert len(names) == 36, f"tool count changed: {len(names)}"
 
 
-# ── The sweep: n = 32 ────────────────────────────────────────────────────────
+# ── The sweep: n = 36 ────────────────────────────────────────────────────────
 
 async def test_every_tool_presents_the_callers_identity_upstream(upstream):
     """For every tool, for two different tenants: the upstream request must
