@@ -354,7 +354,7 @@ tag-name heuristic.
 1. `pytest tests/mcp_agent_test.py -v -s` — green, 27 collected, report written.
 2. Read `tests/mcp_agent_results.json`; re-check every number you plan to say.
 3. Beats 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 in order. 7 is not optional.
-4. Say "46 vendor packs across 20 verticals". Never "18 OEM families", never
+4. Say "52 vendor packs across 20 verticals". Never "18 OEM families", never
    "14 protocol adapters" (12 of 15 declared are usable).
 5. Say the corpus is **MIT-public** at `github.com/FoundryNet/canonical-schema`.
    The moat is the per-vendor polarity/enum decoder tier, not the mappings.
