@@ -48,7 +48,7 @@ async def test_every_tool_has_sweep_arguments():
 
 async def test_every_tool_presents_the_callers_identity_upstream(upstream):
     """For every tool, for two different tenants: the upstream request must
-    carry THAT tenant's key and name THAT tenant. n = 32 tools x 2 tenants."""
+    carry THAT tenant's key and name THAT tenant. n = 36 tools x 2 tenants."""
     names = await _registry_names()
     checked = 0
     no_upstream = []
@@ -172,7 +172,7 @@ async def test_an_oauth_caller_gets_a_PARSEABLE_refusal_over_the_wire(upstream, 
     middleware, so a refusal raised at the upstream hop reached the client as a
     sentence — unparseable by the agent it is meant to redirect — and logged an
     ERROR traceback for a routine refusal on every call. The gate now refuses
-    before `call_next`. n = 32 tools.
+    before `call_next`. n = 36 tools.
     """
     import gating as g
     from mcp_client import MCPSession, app_client

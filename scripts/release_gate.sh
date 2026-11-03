@@ -85,7 +85,7 @@ if [ -x "$VENV/bin/python" ]; then
          -u MCP_JWT_SECRET -u STRIPE_SECRET_KEY -u ORIGIN_SHARED_SECRET \
          PYTHONPATH="$REPO" "$VENV/bin/python" -c "
 import mcp_server, gating
-assert len(gating.ALL_TOOLS) == 32, len(gating.ALL_TOOLS)
+assert len(gating.ALL_TOOLS) == 36, len(gating.ALL_TOOLS)
 app = mcp_server.build_dual_app()
 assert app is not None
 " >/dev/null 2>&1; then
