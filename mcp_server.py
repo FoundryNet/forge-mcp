@@ -869,8 +869,8 @@ async def verify_record(
 
 
 # Retired MCP tool (2026-07-10): no longer decorated with @mcp.tool, so it is
-# absent from tools/list and cannot be called over the wire — brings the raw
-# decorator count to 27, matching the public tools_count. Kept as a plain
+# absent from tools/list and cannot be called over the wire, so it is not
+# counted in the public tools_count. Kept as a plain
 # internal function only so any in-process reference still routes to
 # verify_record. All new callers must use verify_record.
 async def verify_on_chain(

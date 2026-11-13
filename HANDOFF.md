@@ -1,7 +1,7 @@
 # forge-mcp — HANDOFF
 
 Repo: `github.com/FoundryNet/forge-mcp` · Railway service `162115b7-b420-4a02-8cff-ddad7be02dc2`
-(`foundrynet-mcp`) · public endpoint `mcp.foundrynet.io/mcp` (Streamable HTTP, 32 tools, v3.4.4).
+(`foundrynet-mcp`) · public endpoint `mcp.foundrynet.io/mcp` (Streamable HTTP, 36 tools, v3.4.4).
 
 Deploy: **`cd ~/forge-mcp && git fetch origin && git checkout main && git pull --ff-only && ./deploy.sh`**
 
