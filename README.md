@@ -129,7 +129,8 @@ Identity & data: `identify_machine`, `normalize_telemetry`, `query_machine_histo
 `prediction_accuracy`. Operations: `calculate_oee`, `fleet_oee`, `energy_consumption`,
 `shift_report`, `diagnose_machine`, `health_index`. Guardrails: `check_guardrail`,
 `list_guardrails`. Agents on your kernel: `get_agent_card`,
-`list_agents`. Work records: `verify_record`. Demo: `fire_sandbox` (the full watch → fire →
+`list_agents`. Alerts: `set_alert`, `list_alerts`, `delete_alert`, `alert_history`.
+Work records: `verify_record`. Demo: `fire_sandbox` (the full watch → fire →
 settle loop, no card).
 
 `get_agent_card` and `list_agents` are scoped to the agents connected to your kernel instance
