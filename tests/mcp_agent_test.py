@@ -842,9 +842,11 @@ async def test_coverage_counts_say_what_they_measure(forge):
     assert len(packs["verticals"]) == 20, packs["verticals"]
     # 49 -> 52 (2026-11-02): forge-prod #257 (fanuc_cnc_macro + fanuc_robot_sysvar)
     # and #258 (conveyor_drive_common); verticals unchanged at 20.
-    assert packs["packs_loaded"] == 52, (
-        f"{packs['packs_loaded']} packs loaded, not 52 - prod /health reports "
-        f"52 vendor packs across 20 verticals")
+    # 52 -> 53 (2026-11-18): forge-prod #333 (fanuc_focas, corpus 3.0.0), live on
+    # prod 4ecf575; verticals unchanged at 20.
+    assert packs["packs_loaded"] == 53, (
+        f"{packs['packs_loaded']} packs loaded, not 53 - prod /health reports "
+        f"53 vendor packs across 20 verticals")
     assert packs["total_pack_mappings"] > 2000, packs["total_pack_mappings"]
     # CLAUDE.md: auto-pack is DESIGNED, NOT RUNNING. It has never fired, and
     # the local pack layer agrees - 0 auto-pack mappings. Asserted so a demo
