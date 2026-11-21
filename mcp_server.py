@@ -40,6 +40,11 @@ Optional env:
   FORGE_BASE_URL        Default https://forge.foundrynet.io
   PORT                  Default 8080 (Railway sets this automatically)
   REQUEST_TIMEOUT       HTTP read timeout in seconds, default 120 (TimesFM inference is slow)
+  MCPS_SIGNING_KEY      P-256 PKCS#8 PEM. Unset = MCPS envelopes OFF (no change to any
+                        response). Set = every response carries an MCPS signed envelope
+                        and tools/list carries tool-definition signatures (mcps.py).
+  MCPS_ORIGIN           Passport/tool author origin, default https://mcp.foundrynet.io
+  MCPS_PASSPORT_ID      Optional fixed ap_<uuid>; default is derived from the key
 """
 from __future__ import annotations
 
@@ -1628,6 +1633,53 @@ def _load_build_info() -> dict:
 _BUILD_INFO = _load_build_info()
 
 
+# ── MCPS signed envelopes (draft-sharif-mcps-secure-mcp-01) ─────────────────
+# OFF unless MCPS_SIGNING_KEY (a P-256 PKCS#8 PEM) is set; with it unset the
+# session streams are not wrapped and every response is exactly what it was.
+# This signs the TRANSPORT. Forge's data signing (NTE, Ed25519, forge-prod) is
+# separate and untouched. Design: worklog1/mcps_alignment_2026-11-20/MCPS_DESIGN.md
+import mcps  # noqa: E402
+
+mcps.load_from_env(agent_version=mcp.version or "0",
+                   signed_at=(_BUILD_INFO or {}).get("built_at"))
+mcps.install(mcp)
+
+
+async def _mcps_tool_manifest() -> Optional[dict]:
+    """Every tool exactly as tools/list serializes it, with its §6 signature,
+    plus the aggregate hash. None when the MCPS layer is off."""
+    sgn = mcps.signer()
+    if sgn is None:
+        return None
+    listed = await mcp._list_tools_mcp(None)
+    tools = json.loads(json.dumps(
+        listed.model_dump(by_alias=True, mode="json", exclude_none=True)))["tools"]
+    rows, pairs = [], []
+    for t in tools:
+        sig = sgn.tool_signature(t)
+        pairs.append((t["name"], sig["tool_hash"]))
+        rows.append({"name": t["name"], "description": t.get("description"),
+                     "inputSchema": t.get("inputSchema"), "tool_signature": sig})
+    tdh = mcps.tool_definitions_hash(pairs)
+    mcps.set_tool_definitions_hash(tdh)
+    return {"tool_definitions_hash": tdh, "count": len(rows),
+            "hash_rule": "hex(SHA-256(JCS(sorted by name [{name, tool_hash}])))",
+            "tool_hash_rule": "draft-sharif-mcps-secure-mcp-01 §6.3",
+            "author_passport_id": sgn.passport_id, "author_origin": sgn.origin,
+            "kid": sgn.kid, "alg": mcps.ALG, "public_key": sgn.jwk,
+            "tools": sorted(rows, key=lambda r: r["name"])}
+
+
+def _mcps_health() -> dict:
+    sgn = mcps.signer()
+    if sgn is None:
+        return {"enabled": False, "error": mcps.load_error()}
+    return {"enabled": True, "version": mcps.MCPS_VERSION, "alg": mcps.ALG,
+            "kid": sgn.kid, "passport_id": sgn.passport_id, "origin": sgn.origin,
+            "trust_level": 0,
+            "tool_definitions_hash": mcps.current_tool_definitions_hash()}
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
     """Health check for Railway + load balancers. Reports config presence
@@ -1655,7 +1707,27 @@ async def health(request: Request) -> JSONResponse:
         "supabase_configured": bool(os.environ.get("SUPABASE_URL")
                                     and os.environ.get("SUPABASE_SERVICE_KEY")),
         "pricing_url":        os.environ.get("MCP_PRICING_URL", "https://forge.foundrynet.io/pricing"),
+        "mcps":               _mcps_health(),
     })
+
+
+@mcp.custom_route("/.well-known/mcps/passport.json", methods=["GET"])
+async def mcps_passport(request: Request) -> JSONResponse:
+    """The MCPS server identity: self-signed passport (L0 per §3.4), kid, JWK."""
+    sgn = mcps.signer()
+    if sgn is None:
+        return JSONResponse({"error": "mcps_disabled"}, status_code=404)
+    return JSONResponse(sgn.public_view(),
+                        headers={"Cache-Control": "public, max-age=300"})
+
+
+@mcp.custom_route("/.well-known/mcps/tools.json", methods=["GET"])
+async def mcps_tools(request: Request) -> JSONResponse:
+    """Published tool-definition hashes and signatures (§6), to pin against."""
+    man = await _mcps_tool_manifest()
+    if man is None:
+        return JSONResponse({"error": "mcps_disabled"}, status_code=404)
+    return JSONResponse(man, headers={"Cache-Control": "public, max-age=300"})
 
 
 @mcp.custom_route("/ping", methods=["GET"])
@@ -2338,6 +2410,10 @@ def build_dual_app():
     async def _dual_lifespan(app):
         async with main_life(app):
             async with sse_life(app):
+                try:   # warm the aggregate so the first response's binding carries it
+                    await _mcps_tool_manifest()
+                except Exception:
+                    logger.exception("MCPS: could not compute the tool manifest at startup")
                 yield
     main_app.router.lifespan_context = _dual_lifespan
     # M4: raw-origin lockdown. Reject requests that did not arrive through
