@@ -41,11 +41,11 @@ def server_signer():
 class Client:
     """An MCPS-aware client: its own throwaway key and self-signed passport."""
 
-    def __init__(self, origin=ORIGIN):
+    def __init__(self, origin=ORIGIN, passport_id="ap_1b4e28ba-2fa1-4d2b-883f-0016d3cca427"):
         self.key = ec.generate_private_key(ec.SECP256R1())
         self.jwk = mcps.jwk_from_public(self.key.public_key())
         now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-        body = {"id": "ap_" + "1b4e28ba-2fa1-4d2b-883f-0016d3cca427",
+        body = {"id": passport_id,
                 "agent_name": "test-agent", "agent_version": "1.0.0",
                 "issuer": "self", "origin": origin,
                 "issued_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -483,3 +483,71 @@ def test_nonce_store_keys_on_the_nonce_string():
     with pytest.raises(mcps.MCPSError) as e:
         st.add("c" * 32)
     assert e.value.code == -33010
+
+
+# ── nonce store: scoped per client passport (goldfish review 2026-11-23) ─────
+
+def _signed_call(client, i):
+    msg = {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": "x", "arguments": {}}}
+    env = client.sign(msg)
+    hdr = env.pop("mcps")
+    return hdr, env
+
+
+def _inbound(client, store, i):
+    hdr, body = _signed_call(client, i)
+    mcps.check_inbound(hdr, body, client.passport["passport"],
+                       mcps.public_from_jwk(client.jwk), store)
+
+
+def test_one_client_flooding_its_quota_does_not_lock_out_another():
+    store = mcps.NonceStore(scope_cap=5)
+    flooder = Client(passport_id="ap_00000000-0000-4000-8000-00000000f100")
+    honest = Client(passport_id="ap_00000000-0000-4000-8000-0000000000a1")
+    for i in range(5):
+        _inbound(flooder, store, i)
+    with pytest.raises(mcps.MCPSError) as e:
+        _inbound(flooder, store, 99)
+    assert e.value.name == "RATE_LIMITED"
+    _inbound(honest, store, 1)                       # the global store used to refuse this too
+
+
+def test_at_the_global_bound_the_heaviest_client_pays():
+    store = mcps.NonceStore(cap=6, scope_cap=10)
+    flooder = Client(passport_id="ap_00000000-0000-4000-8000-00000000f100")
+    honest = Client(passport_id="ap_00000000-0000-4000-8000-0000000000a1")
+    for i in range(6):
+        _inbound(flooder, store, i)
+    _inbound(honest, store, 1)                       # room made from the flooder's oldest
+    assert store._total == 6
+    with pytest.raises(mcps.MCPSError):
+        for i in range(10, 20):                      # the flooder, now heaviest, is refused itself
+            _inbound(flooder, store, i)
+
+
+def test_a_replay_across_two_sessions_of_one_client_is_still_caught():
+    store = mcps.NonceStore()
+    c = Client()
+    hdr, body = _signed_call(c, 7)
+    pub = mcps.public_from_jwk(c.jwk)
+    mcps.check_inbound(hdr, body, c.passport["passport"], pub, store)
+    with pytest.raises(mcps.MCPSError) as e:         # same passport = same scope, any session
+        mcps.check_inbound(hdr, body, c.passport["passport"], pub, store)
+    assert e.value.name == "REPLAY_DETECTED"
+
+
+def test_the_scope_key_is_still_the_nonce_string():
+    st = mcps.NonceStore()
+    st.add("a" * 32, "ap_x")
+    assert st.seen("a" * 32, "ap_x") and not st.seen("a" * 32, "ap_y")
+
+
+def test_client_passport_origin_is_the_servers_by_scheme_host_and_port():
+    # §4.4 rules 2-3: the server checks the client passport against ITS OWN
+    # origin, compared as scheme + host + port (default port implied).
+    assert mcps._origin("https://mcp.test.invalid") == mcps._origin("https://MCP.test.invalid:443")
+    assert mcps._origin("https://mcp.test.invalid") != mcps._origin("https://mcp.test.invalid:8443")
+    good = Client(origin="https://mcp.test.invalid:443")
+    body, _ = mcps.verify_passport(good.passport, expected_origin=ORIGIN)
+    assert body["origin"].endswith(":443")
+

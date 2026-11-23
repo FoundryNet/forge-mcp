@@ -59,7 +59,8 @@ TRANSCRIPT_METHOD = "mcps/transcript_verify"
 
 TIMESTAMP_WINDOW_S = 300            # §7.2 default (30..3600 permitted)
 CLOCK_SKEW_S = 60                   # §7.2 default
-NONCE_STORE_CAP = 100_000           # §11.4: refuse rather than grow without bound
+NONCE_STORE_CAP = 100_000           # §11.4: memory bound across EVERY client
+NONCE_SCOPE_CAP = 10_000            # per client passport: ~28 signed msgs/s for the whole window
 
 # §3.7 P-256 group order and half order.
 _P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
@@ -434,33 +435,72 @@ def verify_signature(header: dict, message_wo_header: dict, pub) -> bool:
 
 
 class NonceStore:
-    """§7.3: keyed on the nonce string; retained for window + skew."""
+    """§7.3: keyed on the nonce STRING, within the client's passport id;
+    retained for window + skew.
+
+    SCOPED PER CLIENT. One process-wide set let any client that minted a
+    self-signed passport fill it (about 280 signed messages/s for 360 s) and
+    every OTHER session's signed messages then got -33010 for six minutes
+    (goldfish review 2026-11-23). Keying on (passport_id, nonce) still keys on
+    the nonce string, never on message bytes, so the (r, n-s) malleable variant
+    is still a replay. Two connections presenting the SAME passport share a
+    scope, so a replay across sessions of one client is still caught. A nonce
+    cannot be moved into another scope: the signed payload binds passport_id,
+    and a nonce is stored only after the signature verifies (§5.4 step 10).
+
+    §11.4: expired nonces are collected under pressure; one client is
+    rate-limited at `scope_cap` without touching anyone else; and at the global
+    `cap`, as the last resort the draft allows, room is made by evicting the
+    oldest nonces of the HEAVIEST scope -- or, when the requester IS the
+    heaviest, by refusing the requester alone.
+    """
 
     def __init__(self, ttl_s: float = TIMESTAMP_WINDOW_S + CLOCK_SKEW_S,
-                 cap: int = NONCE_STORE_CAP):
+                 cap: int = NONCE_STORE_CAP, scope_cap: int = NONCE_SCOPE_CAP):
         self.ttl = ttl_s
         self.cap = cap
-        self._seen: dict[str, float] = {}
+        self.scope_cap = scope_cap
+        self._seen: dict[str, dict[str, float]] = {}    # scope -> {nonce: expiry}, oldest first
+        self._total = 0
         self._lock = threading.Lock()
 
-    def seen(self, nonce: str) -> bool:
+    def seen(self, nonce: str, scope: str = "") -> bool:
         with self._lock:
-            t = self._seen.get(nonce)
+            t = (self._seen.get(scope) or {}).get(nonce)
             return t is not None and t > time.time()
 
-    def add(self, nonce: str) -> None:
+    def _collect(self, now: float) -> None:
+        for sc in list(self._seen):
+            live = {k: exp for k, exp in self._seen[sc].items() if exp > now}
+            self._total -= len(self._seen[sc]) - len(live)
+            if live:
+                self._seen[sc] = live
+            else:
+                del self._seen[sc]
+
+    def add(self, nonce: str, scope: str = "") -> None:
         with self._lock:
             now = time.time()
-            if len(self._seen) >= self.cap:
-                for k in [k for k, exp in self._seen.items() if exp <= now]:
-                    del self._seen[k]
-                if len(self._seen) >= self.cap:
+            mine = self._seen.get(scope) or {}
+            if len(mine) >= self.scope_cap or self._total >= self.cap:
+                self._collect(now)
+                mine = self._seen.get(scope) or {}
+            if len(mine) >= self.scope_cap:
+                raise MCPSError("RATE_LIMITED", "nonce quota for this client passport is full")
+            if self._total >= self.cap:
+                heaviest = max(self._seen, key=lambda sc: len(self._seen[sc]))
+                if heaviest == scope or len(self._seen[heaviest]) <= len(mine) + 1:
                     raise MCPSError("RATE_LIMITED", "nonce store full")
-            self._seen[nonce] = now + self.ttl
+                victims = self._seen[heaviest]
+                del victims[next(iter(victims))]           # its oldest nonce
+                self._total -= 1
+            self._seen.setdefault(scope, {})[nonce] = now + self.ttl
+            self._total += 1
 
     def clear(self) -> None:
         with self._lock:
             self._seen.clear()
+            self._total = 0
 
 
 def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional[dict],
@@ -482,7 +522,7 @@ def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional
     if not (isinstance(nonce, str) and len(nonce) == 32
             and all(c in "0123456789abcdefABCDEF" for c in nonce)):
         raise MCPSError("INVALID_SIGNATURE", "mcps.nonce must be 16 bytes, hex-encoded")
-    if nonces.seen(nonce):
+    if nonces.seen(nonce, header["passport_id"]):
         raise MCPSError("REPLAY_DETECTED", "nonce already observed")
     if passport_body is None or pub is None:
         raise MCPSError("INVALID_PASSPORT",
@@ -498,7 +538,7 @@ def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional
         raise MCPSError("INVALID_PASSPORT", "passport.expires_at unparseable")
     if not verify_signature(header, message_wo_header, pub):
         raise MCPSError("INVALID_SIGNATURE", "signature does not verify")
-    nonces.add(nonce)                   # step 10: only after the signature verifies
+    nonces.add(nonce, header["passport_id"])   # step 10: only after the signature verifies
 
 
 def transcript_hash(client_init_params: dict, server_init_result: dict) -> str:
@@ -742,6 +782,10 @@ class _ReadProxy:
                     if MCPS_VERSION not in vers:
                         raise MCPSError("VERSION_MISMATCH", "server supports MCPS 1.0 only")
                     if cap.get("passport") is not None:
+                        # §4.4 rule 2: "When a client presents a passport, the
+                        # server MUST verify that the passport's origin matches
+                        # ITS OWN published URI" -- the server's origin, by
+                        # scheme + host + port (rule 3, RFC 6454; see _origin).
                         body, pub = verify_passport(cap["passport"],
                                                     expected_origin=s.signer.origin)
                         s.client_passport, s.client_pub = body, pub
