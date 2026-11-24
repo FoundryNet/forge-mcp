@@ -37,6 +37,7 @@ from __future__ import annotations
 import base64
 import datetime as _dt
 import hashlib
+import heapq
 import json
 import logging
 import math
@@ -45,6 +46,7 @@ import secrets
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, Optional
 
 logger = logging.getLogger("foundrynet.mcps")
@@ -65,6 +67,27 @@ FUTURE_SKEW_S = 30                  # owner policy 2026-11-23: at most 30 s AHEA
                                     # future-dated message cannot outlive its nonce (review F3).
 NONCE_STORE_CAP = 100_000           # §11.4: memory bound across EVERY client
 NONCE_SCOPE_CAP = 10_000            # per client passport: ~28 signed msgs/s for the whole window
+
+# Review N1 (2026-11-23). Passports cost nothing to mint, and initialize,
+# notifications and tools/list need no bearer, so a per-PASSPORT quota is no
+# rate limit: an anonymous client spread across many passports filled the one
+# process-wide store and every MCPS client got -33010. Two defences, both
+# applied BEFORE any ECDSA work (§11.4 "rate limiting on incoming messages"):
+#   * a token bucket per connection AND per source -- the caller's key when the
+#     session carries a valid bearer, else the client address -- checked before
+#     the passport or the message signature is verified;
+#   * a session with no valid bearer never writes to the shared store: its
+#     nonces go to a small store of their own, so anonymous traffic can exhaust
+#     only anonymous capacity. Replays are still checked against BOTH stores.
+SOURCE_RATE_PER_S = 10.0            # signed messages per second, per source and per connection
+SOURCE_BURST = 40                   # bucket depth
+SOURCE_TABLE_CAP = 50_000           # buckets kept (LRU): bounded memory however many sources
+ANON_NONCE_STORE_CAP = 10_000       # the unauthenticated store, across every anonymous session
+ANON_NONCE_SCOPE_CAP = 1_000        # per anonymous client passport
+# Which request header carries the client address. The nearest proxy APPENDS to
+# X-Forwarded-For, so its rightmost entry is the one a client cannot forge.
+# Behind Cloudflare set MCPS_CLIENT_IP_HEADER=cf-connecting-ip.
+CLIENT_IP_HEADER_DEFAULT = "x-forwarded-for"
 
 # §3.7 P-256 group order and half order.
 _P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
@@ -469,6 +492,12 @@ class NonceStore:
         self.scope_cap = scope_cap
         self._seen: dict[str, dict[str, float]] = {}    # scope -> {nonce: expiry}, oldest first
         self._total = 0
+        # (expiry, scope, nonce), soonest first. Collection pops only what has
+        # expired, so it is amortised O(log n) per add instead of a scan of the
+        # whole store under the lock on every add at the cap (review F7: 24 ms
+        # per add at 100k, on the event loop). Entries for nonces evicted or
+        # re-added since are stale and are skipped when they surface.
+        self._heap: list[tuple[float, str, str]] = []
         self._lock = threading.Lock()
 
     def seen(self, nonce: str, scope: str = "") -> bool:
@@ -476,14 +505,24 @@ class NonceStore:
             t = (self._seen.get(scope) or {}).get(nonce)
             return t is not None and t > time.time()
 
+    @property
+    def total(self) -> int:
+        """Nonces held (deliberately not __len__: an empty store must stay truthy)."""
+        return self._total
+
     def _collect(self, now: float) -> None:
-        for sc in list(self._seen):
-            live = {k: exp for k, exp in self._seen[sc].items() if exp > now}
-            self._total -= len(self._seen[sc]) - len(live)
-            if live:
-                self._seen[sc] = live
-            else:
-                del self._seen[sc]
+        h = self._heap
+        while h and h[0][0] <= now:
+            exp, sc, n = heapq.heappop(h)
+            d = self._seen.get(sc)
+            if d is not None and d.get(n) == exp:
+                del d[n]
+                self._total -= 1
+                if not d:
+                    del self._seen[sc]
+        if len(h) > 2 * self.cap + 1024:            # stale entries from evictions
+            self._heap = [(e, sc, n) for sc, d in self._seen.items() for n, e in d.items()]
+            heapq.heapify(self._heap)
 
     def add(self, nonce: str, scope: str = "", expires_at: Optional[float] = None) -> None:
         """Store `nonce` in `scope` until `expires_at` (default now + ttl).
@@ -493,10 +532,11 @@ class NonceStore:
         the message itself could be replayed (review F3)."""
         with self._lock:
             now = time.time()
+            self._collect(now)
             mine = self._seen.get(scope) or {}
-            if len(mine) >= self.scope_cap or self._total >= self.cap:
-                self._collect(now)
-                mine = self._seen.get(scope) or {}
+            if nonce in mine:                               # expired, not yet collected
+                del mine[nonce]
+                self._total -= 1
             if len(mine) >= self.scope_cap:
                 raise MCPSError("RATE_LIMITED", "nonce quota for this client passport is full")
             if self._total >= self.cap:
@@ -506,13 +546,74 @@ class NonceStore:
                 victims = self._seen[heaviest]
                 del victims[next(iter(victims))]           # its oldest nonce
                 self._total -= 1
-            self._seen.setdefault(scope, {})[nonce] = max(now + self.ttl, expires_at or 0.0)
+            exp = max(now + self.ttl, expires_at or 0.0)
+            self._seen.setdefault(scope, {})[nonce] = exp
+            heapq.heappush(self._heap, (exp, scope, nonce))
             self._total += 1
 
     def clear(self) -> None:
         with self._lock:
             self._seen.clear()
+            self._heap.clear()
             self._total = 0
+
+
+class RateLimiter:
+    """Token buckets keyed by source (review N1). `take` is O(1), does no I/O
+    and no crypto, so it can run before every expensive check. The table is
+    LRU-bounded at `cap` keys."""
+
+    def __init__(self, rate: float = SOURCE_RATE_PER_S, burst: float = SOURCE_BURST,
+                 cap: int = SOURCE_TABLE_CAP, clock=time.monotonic):
+        self.rate, self.burst, self.cap, self._clock = float(rate), float(burst), cap, clock
+        self._b: "OrderedDict[str, tuple[float, float]]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def take(self, key: str) -> bool:
+        with self._lock:
+            now = self._clock()
+            prev = self._b.pop(key, None)
+            tokens = self.burst if prev is None else min(self.burst, prev[0] + (now - prev[1]) * self.rate)
+            ok = tokens >= 1.0
+            if ok:
+                tokens -= 1.0
+            self._b[key] = (tokens, now)
+            if len(self._b) > self.cap:
+                self._b.popitem(last=False)
+            return ok
+
+    def clear(self) -> None:
+        with self._lock:
+            self._b.clear()
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = float(os.environ.get(name, "") or default)
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+def client_source(request: Any, session_tag: str) -> str:
+    """The rate-limit key for a session with no valid bearer: the client
+    address from the configured header (rightmost entry: the one the nearest
+    proxy appended), else the socket peer, else the connection itself."""
+    hdr = (os.environ.get("MCPS_CLIENT_IP_HEADER") or CLIENT_IP_HEADER_DEFAULT).strip().lower()
+    headers = getattr(request, "headers", None)
+    if headers is not None and hdr:
+        try:
+            v = headers.get(hdr)
+        except Exception:
+            v = None
+        if v:
+            last = str(v).split(",")[-1].strip()
+            if last:
+                return "ip:" + last
+    host = getattr(getattr(request, "client", None), "host", None)
+    if host:
+        return "ip:" + str(host)
+    return "conn:" + session_tag
 
 
 def nonce_scope(passport_id: Any, passport_body: Optional[dict]) -> str:
@@ -536,8 +637,13 @@ def nonce_scope(passport_id: Any, passport_body: Optional[dict]) -> str:
 
 
 def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional[dict],
-                  pub, nonces: NonceStore, now: Optional[float] = None) -> None:
-    """§5.4 steps 2-10, in the draft's order. Raises MCPSError."""
+                  pub, nonces: NonceStore, now: Optional[float] = None,
+                  also_seen: tuple = ()) -> None:
+    """§5.4 steps 2-10, in the draft's order. Raises MCPSError.
+
+    The nonce is stored in `nonces`; a replay is looked for there AND in every
+    store in `also_seen`, so a message first accepted in an authenticated
+    session cannot be replayed through an anonymous one, or the reverse."""
     for f in ("version", "passport_id", "timestamp", "nonce", "signature"):
         if not header.get(f):
             raise MCPSError("INVALID_SIGNATURE", f"mcps.{f} missing")
@@ -557,7 +663,7 @@ def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional
             and all(c in "0123456789abcdefABCDEF" for c in nonce)):
         raise MCPSError("INVALID_SIGNATURE", "mcps.nonce must be 16 bytes, hex-encoded")
     scope = nonce_scope(header["passport_id"], passport_body)
-    if nonces.seen(nonce, scope):
+    if nonces.seen(nonce, scope) or any(o.seen(nonce, scope) for o in also_seen):
         raise MCPSError("REPLAY_DETECTED", "nonce already observed")
     if passport_body is None or pub is None:
         raise MCPSError("INVALID_PASSPORT",
@@ -583,7 +689,17 @@ def transcript_hash(client_init_params: dict, server_init_result: dict) -> str:
 
 # ── module state ────────────────────────────────────────────────────────────
 
-_STATE: dict[str, Any] = {"signer": None, "nonces": NonceStore(), "error": None, "tdh": None}
+def _anon_store() -> NonceStore:
+    return NonceStore(cap=ANON_NONCE_STORE_CAP, scope_cap=ANON_NONCE_SCOPE_CAP)
+
+
+def _limiter() -> RateLimiter:
+    return RateLimiter(rate=_env_float("MCPS_SOURCE_RATE", SOURCE_RATE_PER_S),
+                       burst=_env_float("MCPS_SOURCE_BURST", SOURCE_BURST))
+
+
+_STATE: dict[str, Any] = {"signer": None, "nonces": NonceStore(), "anon_nonces": _anon_store(),
+                          "limiter": _limiter(), "error": None, "tdh": None}
 
 
 def signer() -> Optional[Signer]:
@@ -591,13 +707,25 @@ def signer() -> Optional[Signer]:
 
 
 def nonces() -> NonceStore:
+    """The shared store: written only by sessions with a valid bearer."""
     return _STATE["nonces"]
+
+
+def anon_nonces() -> NonceStore:
+    """The store for sessions with no valid bearer (review N1)."""
+    return _STATE["anon_nonces"]
+
+
+def limiter() -> RateLimiter:
+    return _STATE["limiter"]
 
 
 def configure(sgn: Optional[Signer]) -> None:
     """Install (or remove, with None) the signer. Tests mint throwaway keys."""
     _STATE["signer"] = sgn
     _STATE["nonces"] = NonceStore()
+    _STATE["anon_nonces"] = _anon_store()
+    _STATE["limiter"] = _limiter()
 
 
 def load_from_env(agent_version: str, signed_at: Optional[str] = None) -> Optional[Signer]:
@@ -651,7 +779,15 @@ class _Session:
         self.client_pub = None
         self.client_init_params: Optional[dict] = None
         self.initialized = False            # one initialize per session (review F5)
+        # Review N3: an initialize MCPS admitted is IN FLIGHT until the SDK
+        # answers it. Only its result marks the session initialized; an error
+        # (e.g. -32602, no protocolVersion) undoes what it committed, so a valid
+        # retry is not refused as a second initialize.
+        self.init_inflight = False
+        self.init_id: Any = None
         self.transcript: Optional[str] = None
+        self.callers: dict[str, Optional[str]] = {}   # sha256(bearer) -> key id, or None (invalid)
+        self.unsigned: set = set()          # request ids whose refusal goes out unsigned (N1)
         self.pending: dict[Any, str] = {}   # request id -> method
         self.lock = threading.Lock()
 
@@ -659,6 +795,13 @@ class _Session:
         with self.lock:
             self.seq += 1
             return self.seq
+
+    def reset_identity(self) -> None:
+        self.client_passport = None
+        self.client_pub = None
+        self.client_init_params = None
+        self.aware = False
+        self.transcript = None
 
 
 def _dump(root) -> dict:
@@ -687,6 +830,7 @@ class _WriteProxy:
             self._sign(msg)
         except Exception:  # signing must never take the session down
             logger.exception("MCPS: failed to sign an outbound message; sent unsigned")
+        self._track(msg)
         await self._inner.send(msg)
 
     def send_nowait(self, msg):
@@ -694,7 +838,25 @@ class _WriteProxy:
             self._sign(msg)
         except Exception:
             logger.exception("MCPS: failed to sign an outbound message; sent unsigned")
+        self._track(msg)
         return self._inner.send_nowait(msg)
+
+    def _track(self, msg) -> None:
+        """Review N3: the SDK's answer to the in-flight initialize decides it.
+        A result makes the session initialized; an error undoes the passport,
+        awareness and transcript that initialize committed."""
+        import mcp.types as t
+        s = self._s
+        if not s.init_inflight:
+            return
+        root = getattr(getattr(msg, "message", None), "root", None)
+        if not isinstance(root, (t.JSONRPCResponse, t.JSONRPCError)) or root.id != s.init_id:
+            return
+        s.init_inflight = False
+        if isinstance(root, t.JSONRPCResponse):
+            s.initialized = True
+        else:
+            s.reset_identity()
 
     def _sign(self, msg) -> None:
         import mcp.types as t
@@ -702,6 +864,13 @@ class _WriteProxy:
         if root is None:
             return
         s, sg = self._s, self._s.signer
+        rid = getattr(root, "id", None)
+        if rid is not None and rid in s.unsigned:
+            # A RATE_LIMITED refusal: signing it would hand a flood the very
+            # ECDSA work the limit exists to refuse (review N1).
+            s.unsigned.discard(rid)
+            s.pending.pop(rid, None)
+            return
         if isinstance(root, t.JSONRPCResponse):
             method = s.pending.pop(root.id, None)
             result = root.result if isinstance(root.result, dict) else None
@@ -784,9 +953,12 @@ class _ReadProxy:
             if await self._admit(msg):
                 return msg
 
-    async def _reply(self, msg, request_id, *, result=None, error: Optional[MCPSError] = None):
+    async def _reply(self, msg, request_id, *, result=None, error: Optional[MCPSError] = None,
+                     sign: bool = True):
         import mcp.types as t
         from mcp.shared.message import SessionMessage
+        if not sign:
+            self._s.unsigned.add(request_id)
         if error is not None:
             root = t.JSONRPCError(jsonrpc="2.0", id=request_id,
                                   error=t.ErrorData(**error.error_data()))
@@ -795,6 +967,65 @@ class _ReadProxy:
             root = t.JSONRPCResponse(jsonrpc="2.0", id=request_id, result=result)
         await self._w.send(SessionMessage(message=t.JSONRPCMessage(root),
                                           metadata=getattr(msg, "metadata", None)))
+
+    async def _caller(self, msg) -> Optional[str]:
+        """The key id of the session's VALID bearer, or None (review N1).
+
+        Resolved once per distinct bearer per session, off the event loop. A
+        bearer that does not resolve is cached as None: the session is then
+        unauthenticated, and its nonces never reach the shared store."""
+        req = getattr(getattr(msg, "metadata", None), "request_context", None)
+        headers = getattr(req, "headers", None)
+        auth = ""
+        if headers is not None:
+            try:
+                auth = (headers.get("authorization") or "").strip()
+            except Exception:
+                auth = ""
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not token:
+            return None
+        h = hashlib.sha256(token.encode()).hexdigest()
+        s = self._s
+        if h not in s.callers:
+            # A lookup costs a database round trip, so a stream of made-up
+            # bearers is throttled too: by the address, in a bucket of its own,
+            # so an anonymous flood from an address never blocks a real key's
+            # first lookup from it.
+            if not limiter().take("lookup:" + client_source(req, s.session_tag)):
+                raise MCPSError("RATE_LIMITED", "too many signed messages from this source")
+            import anyio
+            import gating
+            try:
+                info = await anyio.to_thread.run_sync(gating.resolve_bearer, token)
+            except Exception:
+                info = None
+            kid = None
+            if isinstance(info, dict):
+                kid = str(info.get("key_id") or info.get("user_id") or "") or None
+            if len(s.callers) >= 8:
+                s.callers.pop(next(iter(s.callers)))
+            s.callers[h] = kid
+            return kid
+        return s.callers[h]
+
+    async def _limit(self, msg) -> Optional[str]:
+        """Review N1: per-connection and per-source token buckets, taken BEFORE
+        the passport or any message signature is verified. Returns the caller's
+        key id (None when the session has no valid bearer)."""
+        s = self._s
+        lim = limiter()
+        if not lim.take("conn:" + s.session_tag):
+            raise MCPSError("RATE_LIMITED", "too many signed messages on this connection")
+        caller = await self._caller(msg)
+        if caller is None:
+            req = getattr(getattr(msg, "metadata", None), "request_context", None)
+            src = client_source(req, s.session_tag)
+        else:
+            src = "caller:" + caller
+        if not lim.take(src):
+            raise MCPSError("RATE_LIMITED", "too many signed messages from this source")
+        return caller
 
     async def _admit(self, msg) -> bool:
         """True to pass the message to the SDK, False if it was answered or dropped here."""
@@ -809,31 +1040,39 @@ class _ReadProxy:
         s = self._s
         try:
             is_init = is_req and root.method == "initialize"
-            if is_init and s.initialized:
+            if is_init and (s.initialized or s.init_inflight):
                 # One passport per session, no swaps (review F5): a second
                 # initialize would rebind the session's MCPS identity mid-stream.
                 raise MCPSError("ALREADY_INITIALIZED", "this session is already initialized")
-            if is_init:
-                params = root.params if isinstance(root.params, dict) else {}
-                s.client_init_params = json.loads(json.dumps(params))
-                cap = ((params.get("capabilities") or {}).get("mcps")
-                       if isinstance(params.get("capabilities"), dict) else None)
-                if isinstance(cap, dict):
-                    vers = cap.get("version")
-                    vers = vers if isinstance(vers, list) else [vers]
-                    if MCPS_VERSION not in vers:
-                        raise MCPSError("VERSION_MISMATCH", "server supports MCPS 1.0 only")
-                    if cap.get("passport") is not None:
-                        # §4.4 rule 2: "When a client presents a passport, the
-                        # server MUST verify that the passport's origin matches
-                        # ITS OWN published URI" -- the server's origin, by
-                        # scheme + host + port (rule 3, RFC 6454; see _origin).
-                        body, pub = verify_passport(cap["passport"],
-                                                    expected_origin=s.signer.origin)
-                        s.client_passport, s.client_pub = body, pub
-                    s.aware = True
             extra = root.model_extra or {}
             hdr = extra.get("mcps")
+            params = cap = None
+            if is_init:
+                params = root.params if isinstance(root.params, dict) else {}
+                cap = ((params.get("capabilities") or {}).get("mcps")
+                       if isinstance(params.get("capabilities"), dict) else None)
+            presents = isinstance(cap, dict) and cap.get("passport") is not None
+            caller = None
+            if hdr is not None or presents:
+                # Review N1: every message that would cost ECDSA work pays a
+                # token from its connection's and its source's bucket first.
+                caller = await self._limit(msg)
+            # Review N3: nothing is committed to the session until this
+            # initialize has passed every MCPS check; until then the passport
+            # lives in these locals.
+            passport, pub = s.client_passport, s.client_pub
+            if is_init and isinstance(cap, dict):
+                vers = cap.get("version")
+                vers = vers if isinstance(vers, list) else [vers]
+                if MCPS_VERSION not in vers:
+                    raise MCPSError("VERSION_MISMATCH", "server supports MCPS 1.0 only")
+                if presents:
+                    # §4.4 rule 2: "When a client presents a passport, the
+                    # server MUST verify that the passport's origin matches
+                    # ITS OWN published URI" -- the server's origin, by
+                    # scheme + host + port (rule 3, RFC 6454; see _origin).
+                    passport, pub = verify_passport(cap["passport"],
+                                                    expected_origin=s.signer.origin)
             if hdr is None and s.client_passport is not None and not is_init:
                 # Owner policy 2026-11-23 (review F2): a client that has
                 # presented a passport is identified, and an unsigned message
@@ -849,16 +1088,22 @@ class _ReadProxy:
                     raise MCPSError("INVALID_SIGNATURE", "mcps header must be an object")
                 body = _dump(root)
                 body.pop("mcps", None)
-                check_inbound(hdr, body, s.client_passport, s.client_pub, nonces())
+                # Review N1: only a session with a valid bearer writes to the
+                # shared store; a replay is looked for in both.
+                store, other = (nonces(), anon_nonces()) if caller else (anon_nonces(), nonces())
+                check_inbound(hdr, body, passport, pub, store, also_seen=(other,))
             if is_init:
-                s.initialized = True
+                s.client_init_params = json.loads(json.dumps(params))
+                s.client_passport, s.client_pub = passport, pub   # None unless presented
+                s.aware = isinstance(cap, dict)
+                s.init_inflight, s.init_id = True, root.id
             if is_req and root.method == TRANSCRIPT_METHOD:
                 await self._transcript(msg, root)
                 return False
         except MCPSError as e:
             logger.info("MCPS: rejected %s (%s)", getattr(root, "method", "?"), e)
             if is_req:
-                await self._reply(msg, root.id, error=e)
+                await self._reply(msg, root.id, error=e, sign=e.name != "RATE_LIMITED")
             return False
         if is_req:
             s.pending[root.id] = root.method

@@ -818,3 +818,465 @@ async def test_a_bad_transcript_signature_is_refused(server_signer):
         assert env["error"]["code"] == -33012, env
     finally:
         await ctx.__aexit__(None, None, None)
+
+
+# ═══ 2026-11-24: re-review of 4f0f090 — N1, N3 and the twelve surviving mutants (N5) ═══
+
+import time as _time
+
+import mcp.types as _t
+from mcp.shared.message import ServerMessageMetadata, SessionMessage
+
+GET_COVERAGE = {"name": "get_coverage", "arguments": {}}
+# A bearer in a real key namespace that names no row (built at runtime, so it
+# never reads as a key literal).
+UNKNOWN_BEARER = "fnet" + "_" + "unknown-" * 3
+
+
+def _post_from(s: MCPSession, payload: dict, ip: str = None):
+    """POST on session `s`, optionally from client address `ip` (X-Forwarded-For)."""
+    extra = {"X-Forwarded-For": f"198.51.100.200, {ip}"} if ip else None
+    return s._c.post(s._path, json=payload, headers=s._headers(extra))
+
+
+async def _open(c, client, token=TENANT_A_KEY, *, ip=None, with_passport=True, version="1.0"):
+    """Like _aware_session but on an existing app client, so many sessions share one app."""
+    s = MCPSession(c, token)
+    cap = {"version": version, "trust_level": 0}
+    if with_passport:
+        cap["passport"] = client.passport
+    s._id += 1
+    resp = await _post_from(s, {"jsonrpc": "2.0", "id": s._id, "method": "initialize",
+                                "params": {"protocolVersion": PROTOCOL_VERSION,
+                                           "capabilities": {"mcps": cap},
+                                           "clientInfo": {"name": "mcps-test", "version": "1"}}}, ip)
+    s._sid = resp.headers.get("mcp-session-id")
+    note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    await _post_from(s, client.sign(note) if with_passport else note, ip)
+    return s, (_parse(resp) or {})
+
+
+def _counting_verifies(monkeypatch) -> list:
+    """Count every ECDSA verification mcps performs (passport and message)."""
+    calls = []
+    real = mcps.verify_p1363
+
+    def spy(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+    monkeypatch.setattr(mcps, "verify_p1363", spy)
+    return calls
+
+
+# ── N1: unauthenticated sessions never spend the shared nonce store ─────────
+
+async def test_an_anonymous_passport_flood_cannot_fill_the_shared_store(server_signer):
+    """The re-review's e2e attack: 20 anonymous sessions, each with a fresh
+    self-signed passport and one signed notification, filled a cap-20 store and
+    the victim's signed tools/call got -33010."""
+    mcps._STATE["nonces"] = mcps.NonceStore(cap=20)
+    mcps._STATE["limiter"] = mcps.RateLimiter(rate=1e6, burst=1e6)    # isolate the store
+    async with app_client() as c:
+        for i in range(21):
+            await _open(c, Client(passport_id=f"ap_00000000-0000-4000-8000-{i:012d}"), token=None)
+        assert mcps.nonces().total == 0, "an anonymous session wrote to the shared store"
+        assert mcps.anon_nonces().total == 21
+        victim = Client()
+        s, _ = await _open(c, victim)
+        env = await _raw(s, victim.sign({"jsonrpc": "2.0", "id": 90, "method": "tools/call",
+                                         "params": GET_COVERAGE}))
+        assert "result" in env, env
+        assert mcps.nonces().total == 2                     # the victim's note and call
+
+
+async def test_an_invalid_bearer_counts_as_anonymous(server_signer):
+    async with app_client() as c:
+        await _open(c, Client(), token=UNKNOWN_BEARER)
+        assert mcps.nonces().total == 0 and mcps.anon_nonces().total == 1
+
+
+async def test_a_replay_from_an_authenticated_session_through_an_anonymous_one_is_caught(
+        server_signer):
+    victim = Client()
+    async with app_client() as c:
+        s, _ = await _open(c, victim)
+        signed = victim.sign({"jsonrpc": "2.0", "id": 91, "method": "tools/list", "params": {}})
+        assert "result" in await _raw(s, signed)
+        # The attacker presents the victim's (public) passport with no bearer
+        # and replays the captured message verbatim.
+        a = MCPSession(c, None)
+        a._id += 1
+        resp = await a._post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                              "params": {"protocolVersion": PROTOCOL_VERSION,
+                                         "capabilities": {"mcps": {"version": "1.0",
+                                                                   "passport": victim.passport}},
+                                         "clientInfo": {"name": "x", "version": "1"}}})
+        a._sid = resp.headers.get("mcp-session-id")
+        env = await _raw(a, signed)
+        assert env["error"]["code"] == -33005, env
+
+
+def test_a_replay_is_looked_for_in_every_store():
+    c = Client()
+    shared, anon = mcps.NonceStore(), mcps.NonceStore()
+    hdr, body = _signed_call(c, 1)
+    _check(c, hdr, body, store=shared)
+    with pytest.raises(mcps.MCPSError) as e:
+        mcps.check_inbound(hdr, body, c.passport["passport"], mcps.public_from_jwk(c.jwk),
+                           anon, also_seen=(shared,))
+    assert e.value.name == "REPLAY_DETECTED"
+    assert anon.total == 0
+
+
+# ── N1: the per-source limit runs before any ECDSA work ─────────────────────
+
+async def test_the_source_limit_refuses_before_any_signature_is_verified(server_signer, monkeypatch):
+    mcps._STATE["limiter"] = mcps.RateLimiter(rate=1e-9, burst=2)
+    verifies = _counting_verifies(monkeypatch)
+    async with app_client() as c:
+        await _open(c, Client(), token=None, ip="203.0.113.7")          # 2 tokens: passport + note
+        n = len(verifies)
+        assert n == 2
+        # The address's bucket is empty: a new passport from it is refused
+        # with no verification at all.
+        s = MCPSession(c, None)
+        resp = await _post_from(s, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                    "params": {"protocolVersion": PROTOCOL_VERSION,
+                                               "capabilities": {"mcps": {"version": "1.0",
+                                                                         "passport": Client().passport}},
+                                               "clientInfo": {"name": "x", "version": "1"}}},
+                                "203.0.113.7")
+        env = _parse(resp) or {}
+        assert env["error"]["code"] == -33010, env
+        assert "mcps" not in env, "a RATE_LIMITED refusal must not cost the server a signature"
+        assert len(verifies) == n, "a rate-limited message reached ECDSA verification"
+        # Another address is unaffected.
+        await _open(c, Client(), token=None, ip="203.0.113.8")
+        assert len(verifies) == n + 2
+
+
+async def test_the_connection_limit_holds_however_the_address_varies(server_signer, monkeypatch):
+    mcps._STATE["limiter"] = mcps.RateLimiter(rate=1e-9, burst=3)
+    verifies = _counting_verifies(monkeypatch)
+    cl = Client()
+    async with app_client() as c:
+        s, _ = await _open(c, cl, token=None, ip="192.0.2.1")
+        resp = await _post_from(s, cl.sign({"jsonrpc": "2.0", "id": 5, "method": "tools/list",
+                                            "params": {}}), "192.0.2.2")
+        assert "result" in (_parse(resp) or {})
+        n = len(verifies)
+        resp = await _post_from(s, cl.sign({"jsonrpc": "2.0", "id": 6, "method": "tools/list",
+                                            "params": {}}), "192.0.2.3")
+        env = _parse(resp) or {}
+        assert env["error"]["code"] == -33010 and "connection" in env["error"]["data"]["detail"], env
+        assert "mcps" not in env, "a RATE_LIMITED refusal to an aware session must go out unsigned"
+        assert len(verifies) == n
+
+
+async def test_an_anonymous_flood_from_an_address_does_not_throttle_a_caller_with_a_key(
+        server_signer):
+    mcps._STATE["limiter"] = mcps.RateLimiter(rate=1e-9, burst=2)
+    async with app_client() as c:
+        await _open(c, Client(), token=None, ip="203.0.113.9")          # the address is spent
+        cl = Client()
+        s, init = await _open(c, cl, ip="203.0.113.9")
+        assert "result" in init, init
+        assert mcps.nonces().total == 1, "the keyed caller's signed note was not admitted"
+
+
+def test_the_bucket_refills_at_its_rate():
+    clock = [0.0]
+    lim = mcps.RateLimiter(rate=2, burst=2, clock=lambda: clock[0])
+    assert lim.take("a") and lim.take("a") and not lim.take("a")
+    assert lim.take("b"), "one source's bucket is not another's"
+    clock[0] = 0.5
+    assert lim.take("a") and not lim.take("a")
+
+
+def test_the_bucket_table_is_bounded():
+    lim = mcps.RateLimiter(rate=1, burst=1, cap=3)
+    for k in "abcd":
+        lim.take(k)
+    assert len(lim._b) == 3 and "a" not in lim._b
+
+
+class _Req:
+    def __init__(self, headers=None, host=None):
+        self.headers = headers or {}
+        self.client = type("C", (), {"host": host})() if host else None
+
+
+def test_the_client_address_is_the_rightmost_forwarded_entry(monkeypatch):
+    monkeypatch.delenv("MCPS_CLIENT_IP_HEADER", raising=False)
+    assert mcps.client_source(_Req({"x-forwarded-for": "6.6.6.6, 10.0.0.1"}, "1.1.1.1"), "t") \
+        == "ip:10.0.0.1"
+    assert mcps.client_source(_Req({}, "1.1.1.1"), "t") == "ip:1.1.1.1"
+    assert mcps.client_source(None, "t") == "conn:t"
+    monkeypatch.setenv("MCPS_CLIENT_IP_HEADER", "CF-Connecting-IP")
+    assert mcps.client_source(_Req({"cf-connecting-ip": "9.9.9.9",
+                                    "x-forwarded-for": "6.6.6.6"}, "1.1.1.1"), "t") == "ip:9.9.9.9"
+
+
+# ── F7: collection is amortised, and runs on every add ──────────────────────
+
+def test_expired_nonces_are_collected_on_add_below_the_cap(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(mcps.time, "time", lambda: clock[0])
+    st = mcps.NonceStore(ttl_s=10, cap=1_000_000)
+    for i in range(500):
+        st.add(f"{i:032x}", f"s{i % 7}")
+    assert st.total == 500
+    clock[0] = 1011.0
+    st.add("f" * 32, "s0")
+    assert st.total == 1 and set(st._seen) == {"s0"}
+    assert len(st._heap) == 1
+
+
+def test_a_re_added_expired_nonce_is_counted_once(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(mcps.time, "time", lambda: clock[0])
+    st = mcps.NonceStore(ttl_s=10)
+    st.add("a" * 32, "s")
+    clock[0] = 10.5
+    st._heap.clear()                    # an entry the heap no longer names
+    st.add("a" * 32, "s")
+    assert st.total == 1
+
+
+# ── N3: a rejected initialize leaves nothing behind ─────────────────────────
+
+async def test_an_initialize_mcps_rejects_leaves_no_passport_behind(server_signer):
+    cl = Client()
+    async with app_client() as c:
+        s = MCPSession(c, TENANT_A_KEY)
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": PROTOCOL_VERSION,
+                           "capabilities": {"mcps": {"version": "1.0", "passport": cl.passport}},
+                           "clientInfo": {"name": "x", "version": "1"}}}
+        bad = cl.sign(init)
+        bad["mcps"]["signature"] = cl.sign(init)["mcps"]["signature"]   # signs another nonce
+        resp = await s._post(bad)
+        s._sid = resp.headers.get("mcp-session-id")
+        assert (_parse(resp) or {})["error"]["code"] == -33004
+        # A plain retry, no passport, no capabilities.mcps.
+        retry = await _raw(s, {"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                               "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                                          "clientInfo": {"name": "x", "version": "1"}}})
+        assert "result" in retry and "mcps" not in retry, retry
+        await s._c.post(s._path, json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                        headers=s._headers())
+        env = await _raw(s, {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
+        assert "result" in env and "mcps" not in env, env
+
+
+async def test_an_initialize_the_sdk_rejects_can_be_retried(server_signer):
+    cl = Client()
+    async with app_client() as c:
+        s = MCPSession(c, TENANT_A_KEY)
+        resp = await s._post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                              "params": {"capabilities": {"mcps": {"version": "1.0",
+                                                                   "passport": cl.passport}},
+                                         "clientInfo": {"name": "x", "version": "1"}}})
+        s._sid = resp.headers.get("mcp-session-id")
+        first = _parse(resp) or {}
+        assert "error" in first and first["error"]["code"] != -32600, first
+        retry = await _raw(s, {"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                               "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                                          "clientInfo": {"name": "x", "version": "1"}}})
+        assert "result" in retry, f"a valid retry was refused: {retry}"
+        await s._c.post(s._path, json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                        headers=s._headers())
+        env = await _raw(s, {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
+        assert "result" in env, "the failed initialize's passport was kept: unsigned call refused"
+
+
+# ── unit harness over the stream shim itself ────────────────────────────────
+
+class _Sink:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, m):
+        self.sent.append(m)
+
+    def send_nowait(self, m):
+        self.sent.append(m)
+
+
+def _shim(sgn):
+    sess = mcps._Session(sgn)
+    w = mcps._WriteProxy(_Sink(), sess)
+    return sess, w, mcps._ReadProxy(None, sess, w)
+
+
+def _sm(d: dict) -> SessionMessage:
+    return SessionMessage(message=_t.JSONRPCMessage.model_validate(d),
+                          metadata=ServerMessageMetadata(request_context=_Req({}, "127.0.0.1")))
+
+
+def _with_passport(sess, cl):
+    sess.client_passport = cl.passport["passport"]
+    sess.client_pub = mcps.public_from_jwk(cl.jwk)
+    sess.aware = sess.initialized = True
+
+
+async def test_an_unsigned_notification_from_an_identified_client_is_dropped(server_signer):
+    sess, w, r = _shim(server_signer)
+    cl = Client()
+    _with_passport(sess, cl)
+    note = {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}}
+    assert await r._admit(_sm(note)) is False
+    assert w._inner.sent == [], "a dropped notification gets no reply"
+    assert await r._admit(_sm(cl.sign(note))) is True
+
+
+async def test_an_initialize_in_flight_blocks_a_second_one(server_signer):
+    sess, w, r = _shim(server_signer)
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                       "clientInfo": {"name": "x", "version": "1"}}}
+    assert await r._admit(_sm(init)) is True
+    assert sess.init_inflight and not sess.initialized
+    assert await r._admit(_sm(dict(init, id=2))) is False
+    assert w._inner.sent[-1].message.root.error.code == -32600
+
+
+async def test_the_sdks_result_is_what_marks_the_session_initialized(server_signer):
+    sess, w, r = _shim(server_signer)
+    cl = Client()
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": PROTOCOL_VERSION,
+                       "capabilities": {"mcps": {"version": "1.0", "passport": cl.passport}},
+                       "clientInfo": {"name": "x", "version": "1"}}}
+    assert await r._admit(_sm(init)) is True
+    assert sess.client_passport is not None and sess.aware
+    await w.send(_sm({"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "bad"}}))
+    assert not sess.initialized and not sess.init_inflight
+    assert sess.client_passport is None and not sess.aware, "the rejected initialize left state"
+    assert await r._admit(_sm(dict(init, id=2))) is True
+    await w.send(_sm({"jsonrpc": "2.0", "id": 2,
+                      "result": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                                 "serverInfo": {"name": "s", "version": "1"}}}))
+    assert sess.initialized and not sess.init_inflight
+
+
+async def test_transcript_verify_before_any_transcript_is_refused(server_signer):
+    sess, w, r = _shim(server_signer)
+    root = _t.JSONRPCRequest(jsonrpc="2.0", id=1, method=mcps.TRANSCRIPT_METHOD, params={})
+    with pytest.raises(mcps.MCPSError) as e:
+        await r._transcript(_sm(root.model_dump()), root)
+    assert e.value.name == "TRANSCRIPT_MISMATCH"
+
+
+# ── N5: the policy mutants that survived the re-review ──────────────────────
+
+async def test_a_second_initialize_is_refused_on_a_session_with_no_passport(server_signer):
+    cl = Client()
+    ctx, s, params, _ = await _aware_session(cl, with_passport=False)
+    try:
+        env = await _raw(s, {"jsonrpc": "2.0", "id": 73, "method": "initialize", "params": params})
+        assert env["error"]["code"] == -32600, env
+    finally:
+        await ctx.__aexit__(None, None, None)
+    async with session(TENANT_A_KEY) as plain:                   # an unaware session too
+        await plain.initialize()
+        env = await _raw(plain, {"jsonrpc": "2.0", "id": 74, "method": "initialize",
+                                 "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                                            "clientInfo": {"name": "x", "version": "1"}}})
+        assert env["error"]["code"] == -32600, env
+
+
+def _iso_at(epoch: float) -> str:
+    d = dt.datetime.fromtimestamp(epoch, dt.timezone.utc)
+    return d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{d.microsecond:06d}Z"
+
+
+@pytest.mark.parametrize("ahead,ok", [(29.0, True), (30.0, True), (30.001, False), (31.0, False)])
+def test_the_future_bound_is_exactly_30_s(ahead, ok):
+    c = Client()
+    base = float(int(_time.time()))
+    msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    env = c.sign(msg, timestamp=_iso_at(base + ahead))
+    hdr = env.pop("mcps")
+    if ok:
+        _check(c, hdr, env, now=base)
+    else:
+        assert _err(_check, c, hdr, env, now=base) == "TIMESTAMP_EXPIRED"
+
+
+@pytest.mark.parametrize("later", [61.0, 299.0, 359.0])
+def test_a_replay_late_in_the_window_is_still_detected(monkeypatch, later):
+    clock = [float(int(_time.time()))]
+    monkeypatch.setattr(mcps.time, "time", lambda: clock[0])
+    c = Client()
+    store = mcps.NonceStore()
+    msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    base = clock[0]
+    env = c.sign(msg, timestamp=_iso_at(base))
+    hdr = env.pop("mcps")
+    _check(c, hdr, env, store=store, now=base)
+    clock[0] = base + later
+    assert _err(_check, c, hdr, env, store=store, now=base + later) == "REPLAY_DETECTED"
+
+
+async def test_initialize_negotiates_the_mcps_version(server_signer):
+    async with app_client() as c:
+        _, env = await _open(c, Client(), version="2.0")
+        assert env["error"]["code"] == -33015, env
+        _, env = await _open(c, Client(), version=["2.0", "1.0"])
+        assert "result" in env, env
+
+
+@pytest.mark.parametrize("nonce", ["a" * 31, "a" * 33, "g" * 32, "a" * 30 + "-_"])
+def test_a_nonce_that_is_not_16_hex_bytes_is_refused(nonce):
+    c = Client()
+    env = c.sign({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}, nonce=nonce)
+    hdr = env.pop("mcps")
+    assert _err(_check, c, hdr, env) == "INVALID_SIGNATURE"
+
+
+def test_a_passport_id_without_the_ap_prefix_is_refused():
+    pp = _passport(Client(passport_id="xp_1b4e28ba-2fa1-4d2b-883f-0016d3cca427"))
+    assert _err(mcps.verify_passport, pp) == "INVALID_PASSPORT"
+
+
+@pytest.mark.parametrize("over", [{"kty": "OKP"}, {"crv": "P-384"}, {"kty": "RSA", "crv": None}])
+def test_a_jwk_that_is_not_ec_p256_is_refused(over):
+    jwk = dict(Client().jwk, **over)
+    assert _err(mcps.public_from_jwk, jwk) == "INVALID_PASSPORT"
+
+
+@pytest.mark.parametrize("field", ["id", "agent_name", "agent_version", "issuer", "origin",
+                                   "issued_at", "expires_at", "public_key"])
+def test_every_required_passport_field_is_required(field):
+    c = Client()
+    body = {k: v for k, v in c.passport["passport"].items() if k != field}
+    pp = {"mcps_version": "1.0", "passport": body, "signature": mcps.sign_p1363(c.key, mcps.jcs(body))}
+    with pytest.raises(mcps.MCPSError) as e:
+        mcps.verify_passport(pp)
+    assert e.value.name == "INVALID_PASSPORT" and field in e.value.detail
+
+
+async def test_a_wrong_transcript_hash_is_refused_even_with_no_passport(server_signer):
+    cl = Client()
+    ctx, s, params, init = await _aware_session(cl, with_passport=False)
+    try:
+        env = await _raw(s, {"jsonrpc": "2.0", "id": 82, "method": "mcps/transcript_verify",
+                             "params": {"transcript_hash": "0" * 64}})
+        assert env["error"]["code"] == -33012, env
+    finally:
+        await ctx.__aexit__(None, None, None)
+
+
+def test_channel_binding_is_covered_by_the_signature():
+    c = Client()
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    nonce, ts = secrets.token_hex(16), mcps.now_iso()
+    base = {"message_hash": mcps.sha256_hex(mcps.jcs(body)), "nonce": nonce,
+            "passport_id": c.passport_id, "timestamp": ts}
+    with_cb = dict(base, channel_binding="cb-value")
+    hdr = {"version": "1.0", "passport_id": c.passport_id, "timestamp": ts, "nonce": nonce,
+           "channel_binding": "cb-value"}
+    pub = mcps.public_from_jwk(c.jwk)
+    assert mcps.verify_signature(dict(hdr, signature=mcps.sign_p1363(c.key, mcps.jcs(with_cb))), body, pub)
+    assert not mcps.verify_signature(dict(hdr, signature=mcps.sign_p1363(c.key, mcps.jcs(base))), body, pub)
