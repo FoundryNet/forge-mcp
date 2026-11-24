@@ -42,6 +42,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import threading
 import time
@@ -65,6 +66,7 @@ FUTURE_SKEW_S = 30                  # owner policy 2026-11-23: at most 30 s AHEA
                                     # Tighter than the draft's symmetric 60 s, and the nonce is
                                     # kept until the message itself expires (NonceStore.add), so a
                                     # future-dated message cannot outlive its nonce (review F3).
+NONCE_MARGIN_S = 1.0               # nonce outlives its message by this much (review N2)
 NONCE_STORE_CAP = 100_000           # §11.4: memory bound across EVERY client
 NONCE_SCOPE_CAP = 10_000            # per client passport: ~28 signed msgs/s for the whole window
 
@@ -112,15 +114,21 @@ ERR = {
 
 
 class MCPSError(Exception):
-    def __init__(self, name: str, detail: str = ""):
+    def __init__(self, name: str, detail: str = "", passport_id: Optional[str] = None):
         self.name = name
         self.code, self.string_code = ERR[name]
         self.detail = detail
+        self.passport_id = passport_id
         super().__init__(f"MCPS_{name}: {detail}")
 
     def error_data(self) -> dict:
-        return {"code": self.code, "message": f"MCPS_{self.name}",
-                "data": {"mcps_code": self.string_code, "detail": self.detail}}
+        """§10: "The "data" object SHOULD include: string_code ... passport_id
+        ... reason" (review F15; was mcps_code/detail). passport_id is the one
+        the message claimed, when it claimed one."""
+        data = {"string_code": self.string_code, "reason": self.detail}
+        if isinstance(self.passport_id, str):
+            data["passport_id"] = self.passport_id
+        return {"code": self.code, "message": f"MCPS_{self.name}", "data": data}
 
 
 # ── RFC 8785 JSON Canonicalization Scheme ───────────────────────────────────
@@ -416,36 +424,104 @@ def strip_envelope(message: dict) -> tuple[Optional[dict], dict, str]:
     return None, m, "none"
 
 
+# §4.2: id "MUST begin with the prefix "ap_" followed by a UUID v4 value".
+_PASSPORT_ID_RE = re.compile(
+    r"ap_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", re.IGNORECASE)
+MAX_ISSUER_CHAIN = 5                # §4.3 limits, "MUST enforce all three" (review F9)
+MAX_CAPABILITIES = 64
+MAX_PASSPORT_BYTES = 8192
+
+
+def trust_anchors() -> dict:
+    """Configured Trust Authority keys (§8.1 "MUST support configuring one or
+    more custom TA public keys as trust anchors"; review F12).
+
+    `MCPS_TRUST_ANCHORS` is a JSON object {issuer: public JWK}. Unset or
+    unreadable means none: a malformed value is logged and ignored, never fatal,
+    and it can only make a passport L0, never raise one."""
+    raw = os.environ.get("MCPS_TRUST_ANCHORS", "").strip()
+    if not raw:
+        return {}
+    try:
+        val = json.loads(raw)
+        return {str(k): v for k, v in val.items() if isinstance(v, dict)} if isinstance(val, dict) else {}
+    except Exception:
+        logger.error("MCPS_TRUST_ANCHORS is not a JSON object; no trust anchors configured")
+        return {}
+
+
 def verify_passport(pp: dict, *, expected_origin: Optional[str] = None,
-                    now: Optional[float] = None):
-    """Self-signature, expiry, optional origin. Returns (body, public_key)."""
+                    now: Optional[float] = None, anchors: Optional[dict] = None):
+    """Format, limits, signature, expiry, optional origin. Returns (body, public_key).
+
+    The trust level the passport EARNS is `passport_trust_level(body, anchors)`;
+    a self-signed or unknown-TA passport is L0 whatever it claims (§3.4)."""
+    t = now if now is not None else time.time()
     if not isinstance(pp, dict) or not isinstance(pp.get("passport"), dict):
         raise MCPSError("INVALID_PASSPORT", "passport object missing")
     body = pp["passport"]
-    if len(jcs(body)) > 8192:
+    if len(jcs(body)) > MAX_PASSPORT_BYTES:
         raise MCPSError("PASSPORT_TOO_LARGE", "passport exceeds 8192 bytes (§4.3)")
+    if pp.get("mcps_version") != MCPS_VERSION:
+        raise MCPSError("INVALID_PASSPORT", 'mcps_version MUST be "1.0" (§4.2)')
     for f in ("id", "agent_name", "agent_version", "issuer", "origin",
               "issued_at", "expires_at", "public_key"):
         if f not in body:
             raise MCPSError("INVALID_PASSPORT", f"passport.{f} missing")
-    if not str(body["id"]).startswith("ap_"):
-        raise MCPSError("INVALID_PASSPORT", "passport.id must start with ap_")
+    if not (isinstance(body["id"], str) and _PASSPORT_ID_RE.fullmatch(body["id"])):
+        raise MCPSError("INVALID_PASSPORT", "passport.id must be ap_ followed by a UUID v4 (§4.2)")
+    chain = body.get("issuer_chain")
+    if chain is not None and (not isinstance(chain, list) or len(chain) > MAX_ISSUER_CHAIN):
+        raise MCPSError("INVALID_PASSPORT", f"issuer_chain deeper than {MAX_ISSUER_CHAIN} (§4.3)")
+    caps = body.get("capabilities")
+    if caps is not None and (not isinstance(caps, list) or len(caps) > MAX_CAPABILITIES):
+        raise MCPSError("INVALID_PASSPORT", f"more than {MAX_CAPABILITIES} capabilities (§4.3)")
     pub = public_from_jwk(body["public_key"])
-    # Only self-signed passports are accepted (no Trust Authority, §8, is
-    # configured), and they are L0 regardless of any trust_level they claim.
-    if body.get("issuer") != "self":
-        raise MCPSError("INVALID_PASSPORT", "only self-signed passports are accepted (no TA configured)")
-    if not verify_p1363(pub, jcs(body), pp.get("signature") or ""):
-        raise MCPSError("INVALID_PASSPORT", "passport signature does not verify")
+    issuer = body.get("issuer")
+    if issuer == "self":
+        if not verify_p1363(pub, jcs(body), pp.get("signature") or ""):
+            raise MCPSError("INVALID_PASSPORT", "passport signature does not verify")
+    else:
+        anchors = trust_anchors() if anchors is None else anchors
+        if isinstance(issuer, str) and issuer in anchors:
+            # A configured TA: its signature MUST verify, or the passport is a forgery.
+            if not verify_p1363(public_from_jwk(anchors[issuer]), jcs(body), pp.get("signature") or ""):
+                raise MCPSError("INVALID_PASSPORT", "passport signature does not verify against its trust anchor")
+        # An UNKNOWN TA: §3.4 "MUST treat it as L0" -- not refuse it (review
+        # F12). Its signature cannot be checked, so the passport binds the key
+        # to the id no more strongly than a self-signed one does, which is
+        # exactly what L0 means. Every message must still be signed by
+        # `public_key`, so possession of the key is still proven per message.
     try:
         exp = parse_iso(body["expires_at"])
     except Exception:
         raise MCPSError("INVALID_PASSPORT", "passport.expires_at unparseable")
-    if (now if now is not None else time.time()) > exp:
+    if t > exp:
         raise MCPSError("PASSPORT_EXPIRED", "passport expired")
-    if expected_origin is not None and _origin(body["origin"]) != _origin(expected_origin):
-        raise MCPSError("ORIGIN_MISMATCH", "passport origin does not match this server")
+    try:
+        iat = parse_iso(body["issued_at"])
+    except Exception:
+        raise MCPSError("INVALID_PASSPORT", "passport.issued_at unparseable")
+    if iat - t > FUTURE_SKEW_S:
+        raise MCPSError("INVALID_PASSPORT", "passport.issued_at is in the future")
+    if expected_origin is not None:
+        try:
+            mismatch = _origin(body["origin"]) != _origin(expected_origin)
+        except ValueError:                          # e.g. port 99999 (review F11)
+            raise MCPSError("ORIGIN_MISMATCH", "passport origin is not a valid URI")
+        if mismatch:
+            raise MCPSError("ORIGIN_MISMATCH", "passport origin does not match this server")
     return body, pub
+
+
+def passport_trust_level(body: dict, anchors: Optional[dict] = None) -> int:
+    """The level a VERIFIED passport earns: its claimed trust_level when a
+    configured TA issued it, else 0 (§3.4: self-signed and unknown-TA are L0)."""
+    anchors = trust_anchors() if anchors is None else anchors
+    if body.get("issuer") != "self" and body.get("issuer") in anchors:
+        lvl = body.get("trust_level")
+        return lvl if isinstance(lvl, int) and not isinstance(lvl, bool) and 0 <= lvl <= 4 else 0
+    return 0
 
 
 def _origin(u: str) -> str:
@@ -478,11 +554,10 @@ class NonceStore:
     cannot be moved into another scope: the signed payload binds passport_id,
     and a nonce is stored only after the signature verifies (§5.4 step 10).
 
-    §11.4: expired nonces are collected under pressure; one client is
+    §11.4: expired nonces are collected on every add; one client is
     rate-limited at `scope_cap` without touching anyone else; and at the global
     `cap`, as the last resort the draft allows, room is made by evicting the
-    oldest nonces of the HEAVIEST scope -- or, when the requester IS the
-    heaviest, by refusing the requester alone.
+    least-recently-added (soonest-expiring) live nonce, see `_evict_oldest`.
     """
 
     def __init__(self, ttl_s: float = TIMESTAMP_WINDOW_S + CLOCK_SKEW_S,
@@ -498,12 +573,16 @@ class NonceStore:
         # per add at 100k, on the event loop). Entries for nonces evicted or
         # re-added since are stale and are skipped when they surface.
         self._heap: list[tuple[float, str, str]] = []
+        self.evictions = 0                  # live nonces evicted at the cap (review F8)
         self._lock = threading.Lock()
 
-    def seen(self, nonce: str, scope: str = "") -> bool:
+    def seen(self, nonce: str, scope: str = "", now: Optional[float] = None) -> bool:
+        """`now` is the caller's clock reading, so a check that compares the
+        same instant against the window AND the nonce expiry cannot straddle
+        the boundary between two reads (review N2)."""
         with self._lock:
             t = (self._seen.get(scope) or {}).get(nonce)
-            return t is not None and t > time.time()
+            return t is not None and t > (time.time() if now is None else now)
 
     @property
     def total(self) -> int:
@@ -524,6 +603,34 @@ class NonceStore:
             self._heap = [(e, sc, n) for sc, d in self._seen.items() for n, e in d.items()]
             heapq.heapify(self._heap)
 
+    def _evict_oldest(self) -> None:
+        """Make room at the global cap by evicting the live nonce that expires
+        SOONEST, whatever its scope: §11.4's "least-recently-used eviction
+        policy as a last resort" (review F8).
+
+        It replaces evicting the HEAVIEST scope's oldest nonce. That policy let
+        an attacker spread load over many scopes until a legitimate busy client
+        was the heaviest, and then it was that client's live nonces that went
+        (replayable). Under this policy no choice of scopes moves the victim:
+        the entry evicted is the one whose message has the least acceptance
+        window left. Every eviction is counted and logged; one client is still
+        bounded by `scope_cap` before it gets anywhere near this."""
+        h = self._heap
+        while h:
+            exp, sc, n = heapq.heappop(h)
+            d = self._seen.get(sc)
+            if d is not None and d.get(n) == exp:
+                del d[n]
+                self._total -= 1
+                if not d:
+                    del self._seen[sc]
+                self.evictions += 1
+                if self.evictions == 1 or self.evictions % 1000 == 0:
+                    logger.warning("MCPS: nonce store at its cap (%d); %d live nonces evicted "
+                                   "so far (oldest first)", self.cap, self.evictions)
+                return
+        raise MCPSError("RATE_LIMITED", "nonce store full")    # pragma: no cover (heap mirrors _seen)
+
     def add(self, nonce: str, scope: str = "", expires_at: Optional[float] = None) -> None:
         """Store `nonce` in `scope` until `expires_at` (default now + ttl).
 
@@ -540,12 +647,7 @@ class NonceStore:
             if len(mine) >= self.scope_cap:
                 raise MCPSError("RATE_LIMITED", "nonce quota for this client passport is full")
             if self._total >= self.cap:
-                heaviest = max(self._seen, key=lambda sc: len(self._seen[sc]))
-                if heaviest == scope or len(self._seen[heaviest]) <= len(mine) + 1:
-                    raise MCPSError("RATE_LIMITED", "nonce store full")
-                victims = self._seen[heaviest]
-                del victims[next(iter(victims))]           # its oldest nonce
-                self._total -= 1
+                self._evict_oldest()
             exp = max(now + self.ttl, expires_at or 0.0)
             self._seen.setdefault(scope, {})[nonce] = exp
             heapq.heappush(self._heap, (exp, scope, nonce))
@@ -649,6 +751,16 @@ def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional
             raise MCPSError("INVALID_SIGNATURE", f"mcps.{f} missing")
     if header["version"] != MCPS_VERSION:
         raise MCPSError("VERSION_MISMATCH", f"mcps.version {header['version']!r} unsupported")
+    if "channel_binding" in header:
+        # §5.3: "When present, the verifier MUST verify that the
+        # "channel_binding" value matches the tls-exporter binding of the
+        # current TLS session." TLS terminates at Cloudflare/Railway, so this
+        # server never sees the session and cannot verify it. Accepting the
+        # field unverified would tell the client it has relay protection it
+        # does not have, so a message carrying it is refused (review N4).
+        raise MCPSError("INVALID_SIGNATURE",
+                        "channel_binding cannot be verified here: TLS terminates at the proxy, "
+                        "so this server has no tls-exporter value; omit the field")
     t = now if now is not None else time.time()
     try:
         ts = parse_iso(header["timestamp"])
@@ -663,7 +775,7 @@ def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional
             and all(c in "0123456789abcdefABCDEF" for c in nonce)):
         raise MCPSError("INVALID_SIGNATURE", "mcps.nonce must be 16 bytes, hex-encoded")
     scope = nonce_scope(header["passport_id"], passport_body)
-    if nonces.seen(nonce, scope) or any(o.seen(nonce, scope) for o in also_seen):
+    if nonces.seen(nonce, scope, t) or any(o.seen(nonce, scope, t) for o in also_seen):
         raise MCPSError("REPLAY_DETECTED", "nonce already observed")
     if passport_body is None or pub is None:
         raise MCPSError("INVALID_PASSPORT",
@@ -679,8 +791,10 @@ def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional
         raise MCPSError("INVALID_PASSPORT", "passport.expires_at unparseable")
     if not verify_signature(header, message_wo_header, pub):
         raise MCPSError("INVALID_SIGNATURE", "signature does not verify")
-    # step 10: only after the signature verifies; kept until the MESSAGE expires.
-    nonces.add(nonce, scope, expires_at=ts + TIMESTAMP_WINDOW_S + CLOCK_SKEW_S)
+    # step 10: only after the signature verifies; kept until the MESSAGE expires,
+    # plus a margin (review N2): the expiry used to equal the last acceptable
+    # instant exactly, so a replay whose clock reads straddled ts + 360 passed.
+    nonces.add(nonce, scope, expires_at=ts + TIMESTAMP_WINDOW_S + CLOCK_SKEW_S + NONCE_MARGIN_S)
 
 
 def transcript_hash(client_init_params: dict, server_init_result: dict) -> str:
@@ -786,6 +900,12 @@ class _Session:
         self.init_inflight = False
         self.init_id: Any = None
         self.transcript: Optional[str] = None
+        self.trust_level = 0                # what the client passport EARNED (§3.4), not what it claims
+        # Review F10: §9.5 step 5 "the connection MUST be terminated with error
+        # code -33012". Once set, the read stream ends (the SDK tears the
+        # session down; later requests on it get 404 "session not found"), and
+        # anything already queued is refused, never served.
+        self.terminated = False
         self.callers: dict[str, Optional[str]] = {}   # sha256(bearer) -> key id, or None (invalid)
         self.unsigned: set = set()          # request ids whose refusal goes out unsigned (N1)
         self.pending: dict[Any, str] = {}   # request id -> method
@@ -802,12 +922,28 @@ class _Session:
         self.client_init_params = None
         self.aware = False
         self.transcript = None
+        self.trust_level = 0
 
 
 def _dump(root) -> dict:
     # Exactly what the transports put on the wire (model_dump_json with
     # by_alias + exclude_none, see mcp/server/{streamable_http,sse,stdio}.py).
     return json.loads(root.model_dump_json(by_alias=True, exclude_none=True))
+
+
+def _dump_received(root) -> dict:
+    """An INBOUND message as the client sent it, for its message_hash (review
+    F14; §5.4 step 7 "compute the message hash from the received JSON-RPC
+    message").
+
+    `_dump`'s exclude_none is right for what this server SENDS and wrong for
+    what it receives: it dropped every member whose value is null, so a
+    top-level `"x": null` added after signing still verified, and a client
+    that signed `"params": null` could never verify. `exclude_unset` keeps
+    exactly the members the parser was given -- explicit nulls and extra
+    members included -- and nothing the model defaulted. Key order and number
+    spelling do not matter: the hash is over JCS, which fixes both."""
+    return json.loads(json.dumps(root.model_dump(mode="json", by_alias=True, exclude_unset=True)))
 
 
 class _WriteProxy:
@@ -943,12 +1079,17 @@ class _ReadProxy:
 
     async def __anext__(self):
         while True:
+            if self._s.terminated:
+                raise StopAsyncIteration
             msg = await self._inner.__anext__()
             if await self._admit(msg):
                 return msg
 
     async def receive(self):
+        import anyio
         while True:
+            if self._s.terminated:
+                raise anyio.EndOfStream
             msg = await self._inner.receive()
             if await self._admit(msg):
                 return msg
@@ -1035,10 +1176,15 @@ class _ReadProxy:
         root = getattr(getattr(msg, "message", None), "root", None)
         is_req = isinstance(root, t.JSONRPCRequest)
         is_note = isinstance(root, t.JSONRPCNotification)
+        s = self._s
+        if isinstance(root, (t.JSONRPCResponse, t.JSONRPCError)):
+            return await self._admit_response(msg, root)
         if not (is_req or is_note):
             return True
-        s = self._s
+        hdr = None
         try:
+            if s.terminated:
+                raise MCPSError("TRANSCRIPT_MISMATCH", "this session was terminated after a transcript mismatch")
             is_init = is_req and root.method == "initialize"
             if is_init and (s.initialized or s.init_inflight):
                 # One passport per session, no swaps (review F5): a second
@@ -1086,7 +1232,7 @@ class _ReadProxy:
             if hdr is not None:
                 if not isinstance(hdr, dict):
                     raise MCPSError("INVALID_SIGNATURE", "mcps header must be an object")
-                body = _dump(root)
+                body = _dump_received(root)
                 body.pop("mcps", None)
                 # Review N1: only a session with a valid bearer writes to the
                 # shared store; a replay is looked for in both.
@@ -1095,18 +1241,68 @@ class _ReadProxy:
             if is_init:
                 s.client_init_params = json.loads(json.dumps(params))
                 s.client_passport, s.client_pub = passport, pub   # None unless presented
+                s.trust_level = passport_trust_level(passport) if passport else 0
                 s.aware = isinstance(cap, dict)
                 s.init_inflight, s.init_id = True, root.id
             if is_req and root.method == TRANSCRIPT_METHOD:
                 await self._transcript(msg, root)
                 return False
-        except MCPSError as e:
+        except Exception as e:
+            if not isinstance(e, MCPSError):
+                # Review F11: anything else raised while verifying (an origin
+                # with port 99999, a 400-digit integer or a lone surrogate the
+                # canonicaliser cannot encode, a NaN channel_binding) used to
+                # escape into the SDK's receive loop and kill the session. §5.4:
+                # "the message MUST be rejected with the appropriate error code".
+                logger.warning("MCPS: %s while verifying %s; rejected",
+                               type(e).__name__, getattr(root, "method", "?"))
+                e = MCPSError("INVALID_PASSPORT" if (is_req and root.method == "initialize"
+                                                     and hdr is None) else "INVALID_SIGNATURE",
+                              f"message could not be verified ({type(e).__name__})")
+            if e.passport_id is None and isinstance(hdr, dict):
+                e.passport_id = hdr.get("passport_id")
             logger.info("MCPS: rejected %s (%s)", getattr(root, "method", "?"), e)
             if is_req:
                 await self._reply(msg, root.id, error=e, sign=e.name != "RATE_LIMITED")
+                if e.name == "TRANSCRIPT_MISMATCH" and root.method == TRANSCRIPT_METHOD:
+                    s.terminated = True                 # review F10, after the -33012 is sent
             return False
         if is_req:
             s.pending[root.id] = root.method
+        return True
+
+    async def _admit_response(self, msg, root) -> bool:
+        """A client's RESPONSE or ERROR (to a server-initiated request).
+
+        Review F13: these bypassed inbound verification entirely, so in a
+        session whose client had presented a passport an unsigned or badly
+        signed response was still handed to the SDK -- against the same
+        signed-required policy (F2) that refuses unsigned requests. Now: an
+        unaware client is unchanged; a signed response is verified like any
+        message; an identified client's unsigned or failing response is
+        DROPPED (there is nothing to reply to a reply with)."""
+        s = self._s
+        if s.terminated:
+            return False
+        extra = root.model_extra or {}
+        hdr = extra.get("mcps")
+        if hdr is None and s.client_passport is None:
+            return True
+        try:
+            if hdr is None:
+                raise MCPSError("INVALID_SIGNATURE",
+                                "signed messages are required once a passport is presented")
+            if not isinstance(hdr, dict):
+                raise MCPSError("INVALID_SIGNATURE", "mcps header must be an object")
+            caller = await self._limit(msg)
+            body = _dump_received(root)
+            body.pop("mcps", None)
+            store, other = (nonces(), anon_nonces()) if caller else (anon_nonces(), nonces())
+            check_inbound(hdr, body, s.client_passport, s.client_pub, store, also_seen=(other,))
+        except Exception as e:
+            logger.info("MCPS: dropped a client %s for id %r (%s: %s)", type(root).__name__,
+                        getattr(root, "id", None), type(e).__name__, e)
+            return False
         return True
 
     async def _transcript(self, msg, root) -> None:
@@ -1131,6 +1327,7 @@ class _ReadProxy:
             # signs the UTF-8 hex string, and so does this.
             "transcript_signature": s.signer.sign(s.transcript.encode()),
             "verified": verified,
+            "client_trust_level": s.trust_level,
         }
         if not verified:
             result["reason"] = "no client passport in this session: the client's signature was not checked"
