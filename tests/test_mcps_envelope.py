@@ -72,21 +72,27 @@ async def _raw(s: MCPSession, payload: dict) -> dict:
     return _parse(await s._post(payload)) or {}
 
 
-async def _aware_session(client, token=TENANT_A_KEY):
-    """Initialize announcing capabilities.mcps (§9.2). Returns (ctx, s, init_params, init_env)."""
+async def _aware_session(client, token=TENANT_A_KEY, *, with_passport=True):
+    """Initialize announcing capabilities.mcps (§9.2). Returns (ctx, s, init_params, init_env).
+
+    With a passport, the notifications/initialized that follows is SIGNED: once a
+    client has presented a passport, unsigned messages are refused (review F2)."""
     ctx = app_client()
     c = await ctx.__aenter__()
     s = MCPSession(c, token)
+    cap = {"version": "1.0", "trust_level": 0}
+    if with_passport:
+        cap["passport"] = client.passport
     params = {"protocolVersion": PROTOCOL_VERSION,
-              "capabilities": {"mcps": {"version": "1.0", "trust_level": 0,
-                                        "passport": client.passport}},
+              "capabilities": {"mcps": cap},
               "clientInfo": {"name": "mcps-test", "version": "1"}}
     s._id += 1
     resp = await s._post({"jsonrpc": "2.0", "id": s._id, "method": "initialize",
                           "params": params})
     s._sid = resp.headers.get("mcp-session-id")
     env = _parse(resp) or {}
-    await s._c.post(s._path, json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+    note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    await s._c.post(s._path, json=client.sign(note) if with_passport else note,
                     headers=s._headers())
     return ctx, s, params, env
 
@@ -334,9 +340,10 @@ async def test_aware_client_gets_conformant_top_level_envelopes(server_signer):
         assert carriage == "top-level"
         assert mcps.META_ENVELOPE not in env["result"]["_meta"]
         assert env["result"]["_meta"][mcps.META_BINDING]["carriage"] == "top-level"
-        # Unsigned requests from an aware client are still served (min_trust_level 0).
+        # A client that presented a passport must sign: unsigned is refused (review F2).
         env = await _raw(s, {"jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {}})
-        _verify_response(env, server_signer)
+        assert env["error"]["code"] == -33004, env
+        _verify_response(env, server_signer)          # the refusal is signed too
     finally:
         await ctx.__aexit__(None, None, None)
 
@@ -551,3 +558,263 @@ def test_client_passport_origin_is_the_servers_by_scheme_host_and_port():
     body, _ = mcps.verify_passport(good.passport, expected_origin=ORIGIN)
     assert body["origin"].endswith(":443")
 
+
+
+# ── review fixes 2026-11-23 (independent review F1-F6) ───────────────────────
+# One negative test per security check. tests/test_mcps_mutations.py deletes
+# each check in a copy of mcps.py and requires this file to go red.
+
+def _passport(client, **body_overrides):
+    """client's passport with fields overridden, RE-SIGNED by the client's key,
+    so only the overridden property is wrong."""
+    body = copy.deepcopy(client.passport["passport"])
+    body.update(body_overrides)
+    return {"mcps_version": "1.0", "passport": body,
+            "signature": mcps.sign_p1363(client.key, mcps.jcs(body))}
+
+
+def _iso(seconds_from_now: float) -> str:
+    t = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds_from_now)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _err(fn, *a, **kw) -> str:
+    with pytest.raises(mcps.MCPSError) as e:
+        fn(*a, **kw)
+    return e.value.name
+
+
+def test_a_good_passport_verifies():
+    # The positive control for every negative below: a failure there is the check.
+    body, _ = mcps.verify_passport(_passport(Client()), expected_origin=ORIGIN)
+    assert body["issuer"] == "self"
+
+
+def test_a_passport_whose_self_signature_fails_is_refused():
+    pp = _passport(Client())
+    pp["passport"]["agent_name"] = "someone-else"          # changed after signing
+    assert _err(mcps.verify_passport, pp, expected_origin=ORIGIN) == "INVALID_PASSPORT"
+    other = Client()
+    pp = _passport(Client())
+    pp["signature"] = mcps.sign_p1363(other.key, mcps.jcs(pp["passport"]))   # wrong signer
+    assert _err(mcps.verify_passport, pp, expected_origin=ORIGIN) == "INVALID_PASSPORT"
+
+
+def test_an_expired_passport_is_refused_at_initialize():
+    pp = _passport(Client(), expires_at=_iso(-60).replace(".000", ""))
+    assert _err(mcps.verify_passport, pp, expected_origin=ORIGIN) == "PASSPORT_EXPIRED"
+
+
+def test_a_passport_not_issued_by_self_is_refused():
+    pp = _passport(Client(), issuer="https://ta.example")
+    assert _err(mcps.verify_passport, pp, expected_origin=ORIGIN) == "INVALID_PASSPORT"
+
+
+def test_a_passport_over_8192_bytes_is_refused():
+    pp = _passport(Client(), agent_name="x" * 9000)
+    assert _err(mcps.verify_passport, pp, expected_origin=ORIGIN) == "PASSPORT_TOO_LARGE"
+
+
+def test_a_jwk_carrying_a_private_member_is_refused():
+    c = Client()
+    jwk = dict(c.jwk, d="AAAA")
+    assert _err(mcps.public_from_jwk, jwk) == "INVALID_PASSPORT"
+    assert _err(mcps.verify_passport, _passport(c, public_key=jwk), expected_origin=ORIGIN) \
+        == "INVALID_PASSPORT"
+
+
+def test_a_passport_for_another_origin_is_refused_directly():
+    pp = _passport(Client(origin="https://evil.example"))
+    assert _err(mcps.verify_passport, pp, expected_origin=ORIGIN) == "ORIGIN_MISMATCH"
+
+
+def _check(client, hdr, body, store=None, passport_body=None, now=None):
+    mcps.check_inbound(hdr, body, passport_body or client.passport["passport"],
+                       mcps.public_from_jwk(client.jwk), store or mcps.NonceStore(), now=now)
+
+
+def test_a_good_inbound_message_is_admitted():
+    c = Client()
+    hdr, body = _signed_call(c, 1)
+    _check(c, hdr, body)                                     # positive control
+
+
+def test_a_passport_that_expired_after_initialize_is_refused_inbound():
+    c = Client()
+    hdr, body = _signed_call(c, 1)
+    stale = dict(c.passport["passport"], expires_at=_iso(-1).replace(".000", ""))
+    assert _err(_check, c, hdr, body, passport_body=stale) == "PASSPORT_EXPIRED"
+
+
+def test_a_header_passport_id_other_than_the_sessions_is_refused():
+    c = Client()
+    imposter = Client(passport_id="ap_00000000-0000-4000-8000-0000000000ff")
+    imposter.key, imposter.jwk = c.key, c.jwk                # same key, different claimed id
+    hdr, body = _signed_call(imposter, 1)
+    assert _err(_check, c, hdr, body) == "INVALID_PASSPORT"
+
+
+def test_a_message_signature_that_does_not_verify_is_refused():
+    c = Client()
+    hdr, body = _signed_call(c, 1)
+    body["params"]["arguments"] = {"x": 1}
+    assert _err(_check, c, hdr, body) == "INVALID_SIGNATURE"
+
+
+def test_a_header_with_another_mcps_version_is_refused():
+    c = Client()
+    hdr, body = _signed_call(c, 1)
+    hdr["version"] = "9.9"
+    assert _err(_check, c, hdr, body) == "VERSION_MISMATCH"
+
+
+def test_a_signed_message_with_no_session_passport_is_refused():
+    c = Client()
+    hdr, body = _signed_call(c, 1)
+    with pytest.raises(mcps.MCPSError) as e:
+        mcps.check_inbound(hdr, body, None, None, mcps.NonceStore())
+    assert e.value.name == "INVALID_PASSPORT"
+
+
+# F3: the future bound is 30 s, and a nonce outlives the message it protects.
+
+def test_a_timestamp_more_than_30_s_ahead_is_refused():
+    c = Client()
+    msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x", "arguments": {}}}
+    env = c.sign(msg, timestamp=_iso(45))
+    hdr = env.pop("mcps")
+    assert _err(_check, c, hdr, env) == "TIMESTAMP_EXPIRED"
+    env = c.sign(msg, timestamp=_iso(20))                    # inside the 30 s bound: admitted
+    hdr = env.pop("mcps")
+    _check(c, hdr, env)
+
+
+def test_a_timestamp_past_the_window_is_refused():
+    c = Client()
+    msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x", "arguments": {}}}
+    env = c.sign(msg, timestamp=_iso(-361))
+    hdr = env.pop("mcps")
+    assert _err(_check, c, hdr, env) == "TIMESTAMP_EXPIRED"
+
+
+def test_a_future_dated_message_keeps_its_nonce_until_the_message_expires():
+    c = Client()
+    store = mcps.NonceStore()
+    msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x", "arguments": {}}}
+    ts = _iso(25)
+    env = c.sign(msg, timestamp=ts)
+    hdr = env.pop("mcps")
+    _check(c, hdr, env, store=store)
+    scope = mcps.nonce_scope(c.passport_id, c.passport["passport"])
+    kept_until = store._seen[scope][hdr["nonce"]]
+    accepted_until = mcps.parse_iso(ts) + mcps.TIMESTAMP_WINDOW_S + mcps.CLOCK_SKEW_S
+    assert kept_until >= accepted_until, (kept_until, accepted_until)
+    # And a replay at the last moment the message is still acceptable is caught.
+    with pytest.raises(mcps.MCPSError) as e:
+        mcps.check_inbound(hdr, env, c.passport["passport"], mcps.public_from_jwk(c.jwk),
+                           store, now=accepted_until - 1)
+    assert e.value.name == "REPLAY_DETECTED"
+
+
+def test_the_nonce_store_honours_a_later_expiry():
+    st = mcps.NonceStore(ttl_s=10)
+    import time as _t
+    far = _t.time() + 1000
+    st.add("a" * 32, "s", expires_at=far)
+    assert st._seen["s"]["a" * 32] == far
+
+
+# F4: an attacker reusing a victim's passport_id cannot spend the victim's quota.
+
+def test_a_borrowed_passport_id_cannot_lock_the_victim_out():
+    store = mcps.NonceStore(scope_cap=5)
+    victim = Client(passport_id="ap_00000000-0000-4000-8000-0000000000a1")
+    attacker = Client(passport_id=victim.passport_id)        # same public id, its own key
+    for i in range(5):
+        _inbound(attacker, store, i)
+    with pytest.raises(mcps.MCPSError) as e:
+        _inbound(attacker, store, 99)
+    assert e.value.name == "RATE_LIMITED"                    # the attacker is limited ...
+    _inbound(victim, store, 1)                               # ... and the victim is not
+
+
+def test_the_scope_binds_the_key_not_only_the_id():
+    a = Client(passport_id="ap_00000000-0000-4000-8000-0000000000a1")
+    b = Client(passport_id=a.passport_id)
+    assert mcps.nonce_scope(a.passport_id, a.passport["passport"]) != \
+        mcps.nonce_scope(b.passport_id, b.passport["passport"])
+    assert mcps.nonce_scope(a.passport_id, a.passport["passport"]) == \
+        mcps.nonce_scope(a.passport_id, copy.deepcopy(a.passport["passport"]))
+
+
+# F2, F5, F6 and the transcript signature, over the real transport.
+
+async def test_an_unsigned_request_after_a_passport_is_refused_and_never_reaches_upstream(
+        server_signer, upstream):
+    cl = Client()
+    ctx, s, _, _ = await _aware_session(cl)
+    try:
+        signed = cl.sign({"jsonrpc": "2.0", "id": 60, "method": "tools/call",
+                          "params": {"name": "get_coverage", "arguments": {}}})
+        assert "result" in await _raw(s, signed)
+        n_up = len(upstream.requests)
+        stripped = {k: v for k, v in signed.items() if k != "mcps"}
+        stripped["id"] = 61
+        env = await _raw(s, stripped)                          # a captured request, header removed
+        assert env["error"]["code"] == -33004, env
+        assert len(upstream.requests) == n_up, "an unsigned request must not reach forge-prod"
+    finally:
+        await ctx.__aexit__(None, None, None)
+
+
+async def test_an_unaware_client_is_still_served_unsigned(server_signer):
+    async with session(TENANT_A_KEY) as plain:
+        env = await _raw(plain, {"jsonrpc": "2.0", "id": 62, "method": "tools/list", "params": {}})
+        assert "result" in env, env
+
+
+async def test_a_second_initialize_is_refused_and_the_passport_is_not_swapped(server_signer):
+    cl = Client()
+    ctx, s, params, _ = await _aware_session(cl)
+    try:
+        intruder = Client(passport_id="ap_00000000-0000-4000-8000-0000000000bb")
+        p2 = copy.deepcopy(params)
+        p2["capabilities"]["mcps"]["passport"] = intruder.passport
+        env = await _raw(s, {"jsonrpc": "2.0", "id": 70, "method": "initialize", "params": p2})
+        assert env["error"]["code"] == -32600, env
+        # The original client still works; the intruder's key does not.
+        ok = await _raw(s, cl.sign({"jsonrpc": "2.0", "id": 71, "method": "tools/call",
+                                    "params": {"name": "get_coverage", "arguments": {}}}))
+        assert "result" in ok, ok
+        bad = await _raw(s, intruder.sign({"jsonrpc": "2.0", "id": 72, "method": "tools/call",
+                                           "params": {"name": "get_coverage", "arguments": {}}}))
+        assert bad["error"]["code"] == -33001, bad
+    finally:
+        await ctx.__aexit__(None, None, None)
+
+
+async def test_no_passport_means_the_transcript_is_never_verified(server_signer):
+    cl = Client()
+    ctx, s, params, init = await _aware_session(cl, with_passport=False)
+    try:
+        th = mcps.transcript_hash(params, init["result"])
+        env = await _raw(s, {"jsonrpc": "2.0", "id": 80, "method": "mcps/transcript_verify",
+                             "params": {"transcript_hash": th, "transcript_signature": "garbage"}})
+        r = env["result"]
+        assert r["verified"] is False and r["transcript_hash"] == th, r
+        assert "no client passport" in r["reason"]
+    finally:
+        await ctx.__aexit__(None, None, None)
+
+
+async def test_a_bad_transcript_signature_is_refused(server_signer):
+    cl = Client()
+    ctx, s, params, init = await _aware_session(cl)
+    try:
+        th = mcps.transcript_hash(params, init["result"])
+        wrong = mcps.sign_p1363(Client().key, th.encode())    # a valid signature by another key
+        env = await _raw(s, cl.sign({"jsonrpc": "2.0", "id": 81, "method": "mcps/transcript_verify",
+                                     "params": {"transcript_hash": th, "transcript_signature": wrong}}))
+        assert env["error"]["code"] == -33012, env
+    finally:
+        await ctx.__aexit__(None, None, None)

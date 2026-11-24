@@ -58,7 +58,11 @@ META_TOOL_DEFS = "io.foundrynet/mcps.tool_definitions"
 TRANSCRIPT_METHOD = "mcps/transcript_verify"
 
 TIMESTAMP_WINDOW_S = 300            # §7.2 default (30..3600 permitted)
-CLOCK_SKEW_S = 60                   # §7.2 default
+CLOCK_SKEW_S = 60                   # §7.2 default: how far in the PAST a timestamp may lag
+FUTURE_SKEW_S = 30                  # owner policy 2026-11-23: at most 30 s AHEAD of this clock.
+                                    # Tighter than the draft's symmetric 60 s, and the nonce is
+                                    # kept until the message itself expires (NonceStore.add), so a
+                                    # future-dated message cannot outlive its nonce (review F3).
 NONCE_STORE_CAP = 100_000           # §11.4: memory bound across EVERY client
 NONCE_SCOPE_CAP = 10_000            # per client passport: ~28 signed msgs/s for the whole window
 
@@ -78,6 +82,9 @@ ERR = {
     "TRANSCRIPT_MISMATCH": (-33012, "MCPS-012"),
     "PASSPORT_TOO_LARGE": (-33013, "MCPS-013"),
     "VERSION_MISMATCH":   (-33015, "MCPS-015"),
+    # Not a draft code: the draft is silent on a second initialize. JSON-RPC
+    # Invalid Request, so a client reads it as "this request is not allowed".
+    "ALREADY_INITIALIZED": (-32600, "INVALID_REQUEST"),
 }
 
 
@@ -478,7 +485,12 @@ class NonceStore:
             else:
                 del self._seen[sc]
 
-    def add(self, nonce: str, scope: str = "") -> None:
+    def add(self, nonce: str, scope: str = "", expires_at: Optional[float] = None) -> None:
+        """Store `nonce` in `scope` until `expires_at` (default now + ttl).
+
+        check_inbound passes the time the MESSAGE stops being acceptable, so a
+        message signed with a future timestamp keeps its nonce for as long as
+        the message itself could be replayed (review F3)."""
         with self._lock:
             now = time.time()
             mine = self._seen.get(scope) or {}
@@ -494,13 +506,33 @@ class NonceStore:
                 victims = self._seen[heaviest]
                 del victims[next(iter(victims))]           # its oldest nonce
                 self._total -= 1
-            self._seen.setdefault(scope, {})[nonce] = now + self.ttl
+            self._seen.setdefault(scope, {})[nonce] = max(now + self.ttl, expires_at or 0.0)
             self._total += 1
 
     def clear(self) -> None:
         with self._lock:
             self._seen.clear()
             self._total = 0
+
+
+def nonce_scope(passport_id: Any, passport_body: Optional[dict]) -> str:
+    """The nonce/quota scope: the passport id AND the RFC 7638 thumbprint of the
+    key the session authenticated with (review F4).
+
+    passport_id alone is chosen by the client and is public (it is in every
+    header), so anyone could mint a self-signed passport with a VICTIM's id,
+    fill that scope and lock the victim out with -33010. Binding the scope to
+    the verified key means only the holder of the victim's private key can
+    spend the victim's quota. It is deliberately not per-SESSION: passports are
+    public, so a per-session scope would let a replay of the victim's signed
+    message through in a new session that presents the victim's passport."""
+    thumb = ""
+    if isinstance(passport_body, dict) and isinstance(passport_body.get("public_key"), dict):
+        try:
+            thumb = jwk_thumbprint(passport_body["public_key"])
+        except Exception:
+            thumb = ""
+    return f"{passport_id}|{thumb}"
 
 
 def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional[dict],
@@ -516,13 +548,16 @@ def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional
         ts = parse_iso(header["timestamp"])
     except Exception:
         raise MCPSError("TIMESTAMP_EXPIRED", "mcps.timestamp unparseable")
-    if t - ts > TIMESTAMP_WINDOW_S + CLOCK_SKEW_S or ts - t > CLOCK_SKEW_S:
+    if t - ts > TIMESTAMP_WINDOW_S + CLOCK_SKEW_S:
         raise MCPSError("TIMESTAMP_EXPIRED", "mcps.timestamp outside the acceptance window")
+    if ts - t > FUTURE_SKEW_S:
+        raise MCPSError("TIMESTAMP_EXPIRED", "mcps.timestamp more than 30 s in the future")
     nonce = header["nonce"]
     if not (isinstance(nonce, str) and len(nonce) == 32
             and all(c in "0123456789abcdefABCDEF" for c in nonce)):
         raise MCPSError("INVALID_SIGNATURE", "mcps.nonce must be 16 bytes, hex-encoded")
-    if nonces.seen(nonce, header["passport_id"]):
+    scope = nonce_scope(header["passport_id"], passport_body)
+    if nonces.seen(nonce, scope):
         raise MCPSError("REPLAY_DETECTED", "nonce already observed")
     if passport_body is None or pub is None:
         raise MCPSError("INVALID_PASSPORT",
@@ -538,7 +573,8 @@ def check_inbound(header: dict, message_wo_header: dict, passport_body: Optional
         raise MCPSError("INVALID_PASSPORT", "passport.expires_at unparseable")
     if not verify_signature(header, message_wo_header, pub):
         raise MCPSError("INVALID_SIGNATURE", "signature does not verify")
-    nonces.add(nonce, header["passport_id"])   # step 10: only after the signature verifies
+    # step 10: only after the signature verifies; kept until the MESSAGE expires.
+    nonces.add(nonce, scope, expires_at=ts + TIMESTAMP_WINDOW_S + CLOCK_SKEW_S)
 
 
 def transcript_hash(client_init_params: dict, server_init_result: dict) -> str:
@@ -614,6 +650,7 @@ class _Session:
         self.client_passport: Optional[dict] = None
         self.client_pub = None
         self.client_init_params: Optional[dict] = None
+        self.initialized = False            # one initialize per session (review F5)
         self.transcript: Optional[str] = None
         self.pending: dict[Any, str] = {}   # request id -> method
         self.lock = threading.Lock()
@@ -771,7 +808,12 @@ class _ReadProxy:
             return True
         s = self._s
         try:
-            if is_req and root.method == "initialize":
+            is_init = is_req and root.method == "initialize"
+            if is_init and s.initialized:
+                # One passport per session, no swaps (review F5): a second
+                # initialize would rebind the session's MCPS identity mid-stream.
+                raise MCPSError("ALREADY_INITIALIZED", "this session is already initialized")
+            if is_init:
                 params = root.params if isinstance(root.params, dict) else {}
                 s.client_init_params = json.loads(json.dumps(params))
                 cap = ((params.get("capabilities") or {}).get("mcps")
@@ -792,12 +834,24 @@ class _ReadProxy:
                     s.aware = True
             extra = root.model_extra or {}
             hdr = extra.get("mcps")
+            if hdr is None and s.client_passport is not None and not is_init:
+                # Owner policy 2026-11-23 (review F2): a client that has
+                # presented a passport is identified, and an unsigned message
+                # from an identified client is refused, not served. Otherwise
+                # stripping the header skips the signature, nonce and timestamp
+                # checks, and a captured request replays unsigned. Applies to
+                # notifications too (they are dropped: e.g. an unsigned
+                # notifications/cancelled could cancel the client's request).
+                raise MCPSError("INVALID_SIGNATURE",
+                                "signed messages are required once a passport is presented")
             if hdr is not None:
                 if not isinstance(hdr, dict):
                     raise MCPSError("INVALID_SIGNATURE", "mcps header must be an object")
                 body = _dump(root)
                 body.pop("mcps", None)
                 check_inbound(hdr, body, s.client_passport, s.client_pub, nonces())
+            if is_init:
+                s.initialized = True
             if is_req and root.method == TRANSCRIPT_METHOD:
                 await self._transcript(msg, root)
                 return False
@@ -817,17 +871,25 @@ class _ReadProxy:
             raise MCPSError("TRANSCRIPT_MISMATCH", "no initialize transcript in this session")
         if p.get("transcript_hash") != s.transcript:
             raise MCPSError("TRANSCRIPT_MISMATCH", "transcript_hash differs from the server's")
+        # No passport = not verified (review F6): with no client key there is
+        # nothing to check the client's transcript_signature against, whatever
+        # it contains, so the server never reports the binding as verified.
+        verified = False
         if s.client_pub is not None:
             if not verify_p1363(s.client_pub, s.transcript.encode(),
                                 p.get("transcript_signature") or ""):
                 raise MCPSError("TRANSCRIPT_MISMATCH", "transcript_signature does not verify")
-        await self._reply(msg, root.id, result={
+            verified = True
+        result = {
             "transcript_hash": s.transcript,
             # §9.5 is silent on bytes vs hex text; the reference implementation
             # signs the UTF-8 hex string, and so does this.
             "transcript_signature": s.signer.sign(s.transcript.encode()),
-            "verified": True,
-        })
+            "verified": verified,
+        }
+        if not verified:
+            result["reason"] = "no client passport in this session: the client's signature was not checked"
+        await self._reply(msg, root.id, result=result)
 
 
 def wrap_streams(read_stream, write_stream):
