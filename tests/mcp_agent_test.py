@@ -818,10 +818,9 @@ async def test_coverage_counts_say_what_they_measure(forge):
     """Coverage returns the registry count, the family count and pack stats -
     and each is checked against the thing it actually measures.
 
-    1,032 is the REGISTRY (1,016 until the 11 electrical-safety canonicals landed
-    2026-10-17; 1,027 until forge-prod #234/#239 added the influent/effluent and
-    stress-battery fields, 2026-10-28/29). It is not the corpus count, not the pack-mapping
-    count, and not deterministic reach. The response keeps them under separate
+    canonical_field_count is the REGISTRY (forge_core.field_registry, read live:
+    1,016 -> 1,027 -> 1,032 -> 1,043 as forge-prod added fields). It is not the
+    corpus count, not the pack-mapping count, and not deterministic reach. The response keeps them under separate
     names and the corpus-derived ones come back null offline rather than
     borrowing the registry's number, which is exactly the drift that made the
     live endpoint report 85 and 1,016 in the same breath.
@@ -832,21 +831,24 @@ async def test_coverage_counts_say_what_they_measure(forge):
     body = out["payload"]
     packs = body["vertical_packs"]
 
-    assert body["canonical_field_count"] == len(_registry.fields())
-    assert body["canonical_field_count"] == 1032, (
-        f"the registry is now {body['canonical_field_count']} fields, not "
-        f"1,032 - prod /health reports it")
+    # The count is checked against the registry it measures, read live from
+    # the forge_core this run loaded -- never a hardcoded literal. A pinned
+    # 1,032 here went stale when the registry grew (1,043) and failed on a
+    # checkout that had moved on, which is a test of the filesystem, not of
+    # get_coverage.
+    assert body["canonical_field_count"] == len(_registry.fields()) > 0
     assert body["family_count"] == len(body["canonical_families"])
     assert body["corpus_oem_tags"] is None
     assert body["corpus_mapped_field_count"] is None
-    assert len(packs["verticals"]) == 20, packs["verticals"]
-    # 49 -> 52 (2026-11-02): forge-prod #257 (fanuc_cnc_macro + fanuc_robot_sysvar)
-    # and #258 (conveyor_drive_common); verticals unchanged at 20.
-    # 52 -> 53 (2026-11-18): forge-prod #333 (fanuc_focas, corpus 3.0.0), live on
-    # prod 4ecf575; verticals unchanged at 20.
-    assert packs["packs_loaded"] == 53, (
-        f"{packs['packs_loaded']} packs loaded, not 53 - prod /health reports "
-        f"53 vendor packs across 20 verticals")
+    # Packs and verticals, likewise, against the forge_core this run loaded
+    # (pack_stats() is what get_coverage reports). The literals that used to
+    # sit here (53 packs / 20 verticals, prod 4ecf575) failed on any newer
+    # forge-prod checkout -- 55 packs on main f72b5aa.
+    from forge_core.universal_normalize import pack_stats as _pack_stats
+    _ps = _pack_stats()
+    assert packs["verticals"] == _ps["verticals"], packs["verticals"]
+    assert packs["packs_loaded"] == _ps["packs_loaded"] > 0, (
+        packs["packs_loaded"], _ps["packs_loaded"])
     assert packs["total_pack_mappings"] > 2000, packs["total_pack_mappings"]
     # CLAUDE.md: auto-pack is DESIGNED, NOT RUNNING. It has never fired, and
     # the local pack layer agrees - 0 auto-pack mappings. Asserted so a demo

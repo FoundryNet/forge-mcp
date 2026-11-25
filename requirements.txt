@@ -10,3 +10,7 @@ supabase>=2.7
 # _resolve_jwt depends on. The release gate asserts the installed version.
 PyJWT>=2.14.0
 stripe>=11.0
+# cryptography: >=43 for RFC 6979 deterministic ECDSA (`deterministic_signing=True`),
+# which the MCPS layer (mcps.py) needs so a tool definition's signature changes
+# only when the definition does. Previously transitive and unpinned.
+cryptography>=43
